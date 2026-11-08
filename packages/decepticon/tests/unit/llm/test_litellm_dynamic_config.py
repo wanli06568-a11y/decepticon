@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -18,6 +21,7 @@ _spec.loader.exec_module(_module)
 collect_requested_models = _module.collect_requested_models
 build_model_entry = _module.build_model_entry
 merge_dynamic_models = _module.merge_dynamic_models
+current_model_routes = _module.current_model_routes
 validate_model_name = _module.validate_model_name
 OPENAI_COMPAT_GATEWAYS = _module.OPENAI_COMPAT_GATEWAYS
 ALLOWED_DYNAMIC_PROVIDERS = _module.ALLOWED_DYNAMIC_PROVIDERS
@@ -26,6 +30,47 @@ _provider_prefix = _module._provider_prefix
 _NO_API_KEY_PROVIDERS = _module._NO_API_KEY_PROVIDERS
 PROVIDER_KEY_ENV_ALIASES = _module.PROVIDER_KEY_ENV_ALIASES
 PROVIDER_EXTRA_PARAMS = _module.PROVIDER_EXTRA_PARAMS
+
+
+def test_current_prod_catalog_is_oss_safe() -> None:
+    catalog = json.loads((_MODULE_PATH.parent / "litellm_prod_catalog.json").read_text())
+    routes = catalog["routes"]
+    names = [route["model_name"] for route in routes]
+    assert len(names) == len(set(names))
+    assert "openai/gpt-5.6-sol" in names
+    assert "runyour/qwen3.8-max" in names
+    assert "openrouter/anthropic/claude-sonnet-5.5" in names
+    assert not any(name.startswith(("subscription/", "admin/", "auth/")) for name in names)
+    assert not any("byok-required" in str(route["litellm_params"]) for route in routes)
+
+
+def test_current_prod_routes_require_real_provider_credentials() -> None:
+    assert current_model_routes({}) == []
+    assert current_model_routes({"OPENAI_API_KEY": "your-openai-key-here"}) == []
+
+    names = {
+        route["model_name"] for route in current_model_routes({"OPENAI_API_KEY": "sk-test-key"})
+    }
+    assert "openai/gpt-5.6-sol" in names
+    assert "anthropic/claude-sonnet-5" not in names
+    assert "runyour/qwen3.8-max" not in names
+
+    missing_base = current_model_routes({"RUNYOUR_API_KEY": "sk-test-key"})
+    assert not any(route["model_name"].startswith("runyour/") for route in missing_base)
+
+
+def test_current_prod_routes_merge_without_duplicates() -> None:
+    config = yaml.safe_load((_MODULE_PATH.parent / "litellm.yaml").read_text())
+    merged = merge_dynamic_models(config, {"OPENAI_API_KEY": "sk-test-key"})
+    names = [route["model_name"] for route in merged["model_list"]]
+    assert len(names) == len(set(names))
+    assert "openai/gpt-5.6-sol" in names
+    assert "openai/gpt-6.1-sol" in names
+    route = next(
+        route for route in merged["model_list"] if route["model_name"] == "openai/gpt-5.6-sol"
+    )
+    assert route["litellm_params"]["api_key"] == "os.environ/OPENAI_API_KEY"
+    assert route["litellm_params"]["additional_drop_params"] == ["temperature"]
 
 
 @pytest.mark.parametrize(
@@ -52,6 +97,11 @@ def test_current_api_models_have_proxy_routes(
     assert route["litellm_params"]["model"] == model
     assert route["litellm_params"]["api_key"] == f"os.environ/{key_env}"
     assert (route.get("model_info", {}).get("mode") == "responses") is response_mode
+    if model.startswith("openai/gpt-6"):
+        assert route["litellm_params"]["allowed_openai_params"] == [
+            "reasoning_effort",
+            "tool_choice",
+        ]
     if model == "gemini/gemini-3.8-flash":
         assert route["litellm_params"]["additional_drop_params"] == [
             "temperature",
@@ -182,7 +232,7 @@ def test_validate_model_name_rejects_other_subscription_prefixes() -> None:
 
 
 def test_merge_dynamic_models_allows_subscription_model_override() -> None:
-    """A user setting ``DECEPTICON_MODEL=auth/gpt-5.4-mini`` together with
+    """A user setting ``DECEPTICON_MODEL=auth/gpt-6-luna`` together with
     ``DECEPTICON_AUTH_CHATGPT=true`` must succeed — the subscription path
     injects the route first, and the API-key validator is skipped because
     the model is already present in the model_list.
@@ -191,11 +241,11 @@ def test_merge_dynamic_models_allows_subscription_model_override() -> None:
         {"model_list": [], "litellm_settings": {"fallbacks": []}},
         {
             "DECEPTICON_AUTH_CHATGPT": "true",
-            "DECEPTICON_MODEL": "auth/gpt-5.4-mini",
+            "DECEPTICON_MODEL": "auth/gpt-6-luna",
         },
     )
     names = {entry["model_name"] for entry in merged["model_list"]}
-    assert "auth/gpt-5.4-mini" in names
+    assert "auth/gpt-6-luna" in names
 
 
 def test_validate_model_name_rejects_legacy_ollama_with_remediation() -> None:
@@ -276,29 +326,46 @@ def test_merge_dynamic_models_registers_only_supported_chatgpt_oauth_routes() ->
     # provider because the ``gpt-*`` slug collides with OpenAI's aliases.
     entries = {entry["model_name"]: entry["litellm_params"] for entry in merged["model_list"]}
     assert entries == {
-        # GPT-5.6-family frontier checkpoints served on the Codex subscription
-        # (all verified 2026-07-13; plain gpt-5.6 400s on the Codex account).
-        "auth/gpt-5.6-sol": {"model": "codex-oauth/oauth-gpt-5.6-sol"},
-        "auth/gpt-5.6-terra": {"model": "codex-oauth/oauth-gpt-5.6-terra"},
-        "auth/gpt-5.6-luna": {"model": "codex-oauth/oauth-gpt-5.6-luna"},
-        "auth/gpt-5.5": {"model": "codex-oauth/oauth-gpt-5.5"},
-        "auth/gpt-5.4": {"model": "codex-oauth/oauth-gpt-5.4"},
-        "auth/gpt-5.4-mini": {"model": "codex-oauth/oauth-gpt-5.4-mini"},
-        # Code-heavy override route. Registered alongside the tier
-        # defaults so per-agent env overrides like
-        # ``DECEPTICON_MODEL_PATCHER=auth/gpt-5.3-codex`` work without a
-        # yaml edit. The ``oauth-`` slug sentinel is required because
-        # ``gpt-5.3-codex`` is in ``open_ai_chat_completion_models``.
-        "auth/gpt-5.3-codex": {"model": "codex-oauth/oauth-gpt-5.3-codex"},
-        "auth/gpt-5.3-codex-spark": {
-            "model": "codex-oauth/oauth-gpt-5.3-codex-spark",
+        "auth/gpt-6-astra": {
+            "model": "codex-oauth/oauth-gpt-6-astra",
+            "allowed_openai_params": ["reasoning_effort"],
+        },
+        "auth/gpt-6.1-sol": {
+            "model": "codex-oauth/oauth-gpt-6.1-sol",
+            "allowed_openai_params": ["reasoning_effort"],
+        },
+        "auth/gpt-6-luna": {
+            "model": "codex-oauth/oauth-gpt-6-luna",
+            "allowed_openai_params": ["reasoning_effort"],
+        },
+        "auth/gpt-5.6-sol": {
+            "model": "codex-oauth/oauth-gpt-5.6-sol",
+            "allowed_openai_params": ["reasoning_effort"],
+        },
+        "auth/gpt-5.6-terra": {
+            "model": "codex-oauth/oauth-gpt-5.6-terra",
+            "allowed_openai_params": ["reasoning_effort"],
+        },
+        "auth/gpt-5.6-luna": {
+            "model": "codex-oauth/oauth-gpt-5.6-luna",
+            "allowed_openai_params": ["reasoning_effort"],
         },
     }
-    assert "auth/gpt-5-nano" not in entries
     assert merged["litellm_settings"]["fallbacks"] == [
-        {"auth/gpt-5.5": ["auth/gpt-5.4"]},
-        {"auth/gpt-5.4": ["auth/gpt-5.4-mini"]},
+        {"auth/gpt-6-astra": ["auth/gpt-6.1-sol"]},
+        {"auth/gpt-6.1-sol": ["auth/gpt-6-luna"]},
     ]
+
+
+@pytest.mark.parametrize(
+    "model", ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark"]
+)
+def test_merge_dynamic_models_rejects_retired_chatgpt_override(model: str) -> None:
+    with pytest.raises(ValueError, match=r"auth/\*"):
+        merge_dynamic_models(
+            {"model_list": []},
+            {"DECEPTICON_AUTH_CHATGPT": "true", "DECEPTICON_MODEL": f"auth/{model}"},
+        )
 
 
 # ── llama.cpp OpenAI-compatible backend (issue #151) ────────────────────
@@ -825,3 +892,367 @@ def test_kimi_gateway_registered_in_openai_compat_gateways() -> None:
     base, key_env = OPENAI_COMPAT_GATEWAYS["kimi"]
     assert base == "https://api.kimi.com/coding/v1"
     assert key_env == "KIMI_API_KEY"
+
+
+def test_kimi_tiers_are_registered_in_static_litellm_config() -> None:
+    """Same gap as the Cheaper Inference regression below, for Kimi for
+    Coding: no static litellm.yaml entry existed for its METHOD_MODELS
+    aliases, so a KIMI_API_KEY-only deployment would 400 on every call.
+    """
+    config_path = Path(__file__).resolve().parents[5] / "config" / "litellm.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    routes = {entry["model_name"]: entry["litellm_params"] for entry in config["model_list"]}
+
+    api_base, api_key_env = OPENAI_COMPAT_GATEWAYS["kimi"]
+    for model_name in ("kimi/k3", "kimi/kimi-for-coding", "kimi/kimi-for-coding-highspeed"):
+        assert model_name in routes, f"{model_name} missing from litellm.yaml model_list"
+        params = routes[model_name]
+        assert params["model"] == f"openai/{model_name.split('/', 1)[1]}"
+        assert params["api_base"] == api_base
+        assert params["api_key"] == f"os.environ/{api_key_env}"
+        assert params.get("additional_drop_params") == ["temperature"]
+
+
+def test_build_model_entry_routes_cheaper_inference_gateway() -> None:
+    entry = build_model_entry("cheaperinference/gpt-5.4-mini")
+
+    assert entry["litellm_params"] == {
+        "model": "openai/gpt-5.4-mini",
+        "api_key": "os.environ/CHEAPER_INFERENCE_API_KEY",
+        "api_base": "https://api.cheaperinference.com/v1",
+    }
+
+
+def test_validate_model_name_accepts_cheaper_inference_models() -> None:
+    for model in (
+        "cheaperinference/claude-sonnet-5",
+        "cheaperinference/gpt-5.4",
+        "cheaperinference/gpt-5.4-mini",
+    ):
+        validate_model_name(model)  # must not raise
+
+
+def test_cheaper_inference_gateway_registered_in_openai_compat_gateways() -> None:
+    base, key_env = OPENAI_COMPAT_GATEWAYS["cheaperinference"]
+    assert base == "https://api.cheaperinference.com/v1"
+    assert key_env == "CHEAPER_INFERENCE_API_KEY"
+
+
+def test_cheaper_inference_tiers_are_registered_in_static_litellm_config() -> None:
+    """Regression: #956 wired CHEAPER_INFERENCE_API through build_model_entry
+    and METHOD_MODELS but never added static litellm.yaml model_list entries
+    for the resolved HIGH/MID/LOW aliases. Every other OPENAI_COMPAT_GATEWAYS
+    provider (opencode, vercel, hf, venice, nanogpt, synthetic, zenmux,
+    qianfan, cfgateway) has one — without it, a deployment configuring ONLY
+    CHEAPER_INFERENCE_API_KEY resolves the factory's tier models to ids the
+    proxy's model_list never registers (merge_dynamic_models only adds models
+    an explicit DECEPTICON_MODEL* override names), so every call 400s.
+    """
+    config_path = Path(__file__).resolve().parents[5] / "config" / "litellm.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    routes = {entry["model_name"]: entry["litellm_params"] for entry in config["model_list"]}
+
+    api_base, api_key_env = OPENAI_COMPAT_GATEWAYS["cheaperinference"]
+    for model_name in (
+        "cheaperinference/claude-sonnet-5",
+        "cheaperinference/gpt-5.4",
+        "cheaperinference/gpt-5.4-mini",
+    ):
+        assert model_name in routes, f"{model_name} missing from litellm.yaml model_list"
+        params = routes[model_name]
+        assert params["model"] == f"openai/{model_name.split('/', 1)[1]}"
+        assert params["api_base"] == api_base
+        assert params["api_key"] == f"os.environ/{api_key_env}"
+
+
+def test_every_gateway_routed_method_model_is_statically_registered() -> None:
+    """General form of the cheaper-inference regression above: any
+    METHOD_MODELS entry whose model id uses an OPENAI_COMPAT_GATEWAYS prefix
+    must have a matching static litellm.yaml model_list entry, or a
+    single-credential deployment for that AuthMethod 400s on every call.
+    """
+    from decepticon_core.types.llm import METHOD_MODELS  # noqa: PLC0415
+
+    config_path = Path(__file__).resolve().parents[5] / "config" / "litellm.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    routes = {entry["model_name"]: entry["litellm_params"] for entry in config["model_list"]}
+
+    missing: list[str] = []
+    for method_models in METHOD_MODELS.values():
+        for model_name in method_models.values():
+            if _provider_prefix(model_name) not in OPENAI_COMPAT_GATEWAYS:
+                continue
+            if model_name not in routes:
+                missing.append(model_name)
+    assert not missing, f"gateway-routed models missing from litellm.yaml model_list: {missing}"
+
+
+def test_cheaper_inference_key_only_resolves_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Close the loop the three tests above only check one link of:
+    credential detection -> tier model selection -> proxy registration.
+
+    With ONLY ``CHEAPER_INFERENCE_API_KEY`` configured (no other provider
+    credential in the environment), the factory's auth detection must
+    select exactly ``cheaper_inference_api``, ``resolve_chain`` must resolve
+    every tier to a ``cheaperinference/*`` model id, and each of those ids
+    must be the one actually registered in litellm.yaml with the matching
+    api_key/api_base. A gap anywhere in that chain means a key-only
+    Cheaper Inference deployment 400s on its very first model call.
+    """
+    from decepticon.llm.factory import auth_inventory  # noqa: PLC0415
+    from decepticon_core.types.llm import (  # noqa: PLC0415
+        METHOD_MODELS,
+        AuthMethod,
+        Credentials,
+        Tier,
+        resolve_chain,
+    )
+
+    monkeypatch.setenv("DECEPTICON_AUTH_PRIORITY", "cheaper_inference_api")
+    monkeypatch.setenv("CHEAPER_INFERENCE_API_KEY", "ci_live_" + "a" * 24)
+
+    inventory = auth_inventory()
+    assert inventory.resolved_chain == (AuthMethod.CHEAPER_INFERENCE_API,)
+
+    config_path = Path(__file__).resolve().parents[5] / "config" / "litellm.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    routes = {entry["model_name"]: entry["litellm_params"] for entry in config["model_list"]}
+    api_base, api_key_env = OPENAI_COMPAT_GATEWAYS["cheaperinference"]
+
+    credentials = Credentials(methods=list(inventory.resolved_chain))
+    for tier, expected_model in METHOD_MODELS[AuthMethod.CHEAPER_INFERENCE_API].items():
+        assert tier in (Tier.HIGH, Tier.MID, Tier.LOW)
+        chain = resolve_chain(tier, credentials)
+        assert chain == [expected_model]
+
+        assert expected_model in routes, f"{expected_model} missing from litellm.yaml model_list"
+        params = routes[expected_model]
+        assert params["model"] == f"openai/{expected_model.split('/', 1)[1]}"
+        assert params["api_base"] == api_base
+        assert params["api_key"] == f"os.environ/{api_key_env}"
+
+
+def test_cheaper_inference_key_only_generated_model_list(tmp_path: Path) -> None:
+    """The factory's key-only tier aliases must survive proxy config generation."""
+    from decepticon.llm.factory import auth_inventory  # noqa: PLC0415
+    from decepticon_core.types.llm import (  # noqa: PLC0415
+        AuthMethod,
+        Credentials,
+        Tier,
+        resolve_chain,
+    )
+
+    api_key = "ci_live_" + "a" * 24
+    config_path = _MODULE_PATH.parent / "litellm.yaml"
+    with patch.dict(os.environ, {"CHEAPER_INFERENCE_API_KEY": api_key}, clear=True):
+        inventory = auth_inventory()
+        assert inventory.resolved_chain == (AuthMethod.CHEAPER_INFERENCE_API,)
+        output = write_dynamic_config(config_path, tmp_path / "generated.yaml")
+
+    generated = yaml.safe_load(output.read_text(encoding="utf-8"))
+    routes = {entry["model_name"]: entry["litellm_params"] for entry in generated["model_list"]}
+    credentials = Credentials(methods=list(inventory.resolved_chain))
+    for tier in (Tier.HIGH, Tier.MID, Tier.LOW):
+        [alias] = resolve_chain(tier, credentials)
+        params = routes[alias]
+        assert params["model"] == f"openai/{alias.split('/', 1)[1]}"
+        assert params["api_base"] == "https://api.cheaperinference.com/v1"
+        assert params["api_key"] == "os.environ/CHEAPER_INFERENCE_API_KEY"
+
+
+# ── Generic OpenAI-compatible gateway (opt-in, #989) ────────────────────
+
+
+def test_compat_gateway_registered_in_openai_compat_gateways() -> None:
+    base, key_env = OPENAI_COMPAT_GATEWAYS["compat"]
+    assert base == "os.environ/OPENAI_COMPAT_GATEWAY_API_BASE"
+    assert key_env == "OPENAI_COMPAT_GATEWAY_API_KEY"
+
+
+def test_build_model_entry_routes_compat_gateway() -> None:
+    entry = build_model_entry("compat/gpt-4o-mini")
+
+    assert entry["litellm_params"] == {
+        "model": "openai/gpt-4o-mini",
+        "api_key": "os.environ/OPENAI_COMPAT_GATEWAY_API_KEY",
+        "api_base": "os.environ/OPENAI_COMPAT_GATEWAY_API_BASE",
+    }
+
+
+def test_validate_model_name_accepts_compat_gateway_models() -> None:
+    validate_model_name("compat/gpt-4o-mini")
+    validate_model_name("compat/vendor/model-slug")
+
+
+def test_compat_gateway_default_off_registers_no_models() -> None:
+    """Stock env with no OPENAI_COMPAT_GATEWAY_* vars must not opt in."""
+    models = collect_requested_models({})
+    assert not any(m.startswith("compat/") for m in models)
+
+
+def test_compat_gateway_placeholder_key_stays_off() -> None:
+    models = collect_requested_models(
+        {
+            "OPENAI_COMPAT_GATEWAY_API_BASE": "https://gateway.example.com/v1",
+            "OPENAI_COMPAT_GATEWAY_API_KEY": "your-openai-compat-gateway-key-here",
+            "OPENAI_COMPAT_GATEWAY_MODEL": "gpt-4o-mini",
+        }
+    )
+    assert not any(m.startswith("compat/") for m in models)
+
+
+def test_compat_gateway_opt_in_registers_model_routes() -> None:
+    models = collect_requested_models(
+        {
+            "OPENAI_COMPAT_GATEWAY_API_BASE": "https://gateway.example.com/v1",
+            "OPENAI_COMPAT_GATEWAY_API_KEY": "sk-compat-" + "a" * 24,
+            "OPENAI_COMPAT_GATEWAY_MODEL": "gpt-4o-mini",
+        }
+    )
+    assert "compat/gpt-4o-mini" in models
+
+
+def test_compat_gateway_per_tier_models(tmp_path: Path) -> None:
+    """Per-tier model envs produce distinct compat/* routes in generated config."""
+    env = {
+        "OPENAI_COMPAT_GATEWAY_API_BASE": "https://gateway.example.com/v1",
+        "OPENAI_COMPAT_GATEWAY_API_KEY": "sk-compat-" + "a" * 24,
+        "OPENAI_COMPAT_GATEWAY_MODEL_HIGH": "big-model",
+        "OPENAI_COMPAT_GATEWAY_MODEL_MID": "mid-model",
+        "OPENAI_COMPAT_GATEWAY_MODEL_LOW": "small-model",
+    }
+    config_path = _MODULE_PATH.parent / "litellm.yaml"
+    with patch.dict(os.environ, env, clear=True):
+        output = write_dynamic_config(config_path, tmp_path / "generated.yaml")
+
+    generated = yaml.safe_load(output.read_text(encoding="utf-8"))
+    routes = {entry["model_name"]: entry["litellm_params"] for entry in generated["model_list"]}
+    for alias, slug in (
+        ("compat/big-model", "big-model"),
+        ("compat/mid-model", "mid-model"),
+        ("compat/small-model", "small-model"),
+    ):
+        assert alias in routes, f"{alias} missing from generated model_list"
+        params = routes[alias]
+        assert params["model"] == f"openai/{slug}"
+        assert params["api_base"] == "os.environ/OPENAI_COMPAT_GATEWAY_API_BASE"
+        assert params["api_key"] == "os.environ/OPENAI_COMPAT_GATEWAY_API_KEY"
+
+
+def test_compat_gateway_key_only_resolves_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Credential detection -> tier model selection -> proxy registration."""
+    from decepticon.llm.factory import auth_inventory  # noqa: PLC0415
+    from decepticon_core.types.llm import (  # noqa: PLC0415
+        AuthMethod,
+        Credentials,
+        Tier,
+        resolve_chain,
+    )
+
+    monkeypatch.setenv("DECEPTICON_AUTH_PRIORITY", "openai_compat_gateway_api")
+    monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_BASE", "https://gateway.example.com/v1")
+    monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_KEY", "sk-compat-" + "a" * 24)
+    monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL", "gpt-4o-mini")
+
+    inventory = auth_inventory()
+    assert inventory.resolved_chain == (AuthMethod.OPENAI_COMPAT_GATEWAY_API,)
+
+    credentials = Credentials(methods=list(inventory.resolved_chain))
+    for tier in (Tier.HIGH, Tier.MID, Tier.LOW):
+        assert resolve_chain(tier, credentials) == ["compat/gpt-4o-mini"]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("OPENAI_COMPAT_GATEWAY_API_BASE", "not-a-url"),
+        ("OPENAI_COMPAT_GATEWAY_API_BASE", "ftp://gateway.example/v1"),
+        ("OPENAI_COMPAT_GATEWAY_API_BASE", "https://"),
+        ("OPENAI_COMPAT_GATEWAY_API_BASE", "https://gateway.example:bad/v1"),
+        ("OPENAI_COMPAT_GATEWAY_API_KEY", "sk-placeholder-" + "a" * 24),
+        ("OPENAI_COMPAT_GATEWAY_API_KEY", "sk-dummy-" + "a" * 24),
+        ("OPENAI_COMPAT_GATEWAY_MODEL", "none"),
+        ("OPENAI_COMPAT_GATEWAY_MODEL", "null"),
+        ("OPENAI_COMPAT_GATEWAY_MODEL", "-"),
+        ("OPENAI_COMPAT_GATEWAY_MODEL", "compat/"),
+        ("OPENAI_COMPAT_GATEWAY_MODEL", "bad model"),
+    ],
+)
+def test_compat_invalid_configuration_disables_factory_and_routes(name: str, value: str) -> None:
+    from decepticon.llm.factory import _openai_compat_gateway_configured
+
+    # Given a complete opt-in with one invalid setting.
+    env = {
+        "OPENAI_COMPAT_GATEWAY_API_BASE": "http://127.0.0.1:8080/v1",
+        "OPENAI_COMPAT_GATEWAY_API_KEY": "sk-compat-" + "a" * 24,
+        "OPENAI_COMPAT_GATEWAY_MODEL": "vendor/model",
+        name: value,
+    }
+    # When both processes inspect the same environment.
+    with patch.dict(os.environ, env, clear=True):
+        configured = _openai_compat_gateway_configured()
+        models = collect_requested_models(env)
+    # Then neither advertises a usable gateway.
+    assert (configured, models) == (False, set())
+
+
+def test_compat_sentinel_override_falls_back_to_shared_model() -> None:
+    from decepticon_core.types.llm import AuthMethod, Credentials, Tier, resolve_chain
+
+    # Given a sentinel tier override and a valid shared model.
+    env = {
+        "OPENAI_COMPAT_GATEWAY_API_BASE": "http://127.0.0.1:8080/v1",
+        "OPENAI_COMPAT_GATEWAY_API_KEY": "sk-compat-" + "a" * 24,
+        "OPENAI_COMPAT_GATEWAY_MODEL": "vendor/shared",
+        "OPENAI_COMPAT_GATEWAY_MODEL_HIGH": "none",
+    }
+    credentials = Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
+    # When selecting the high tier and generating proxy routes.
+    with patch.dict(os.environ, env, clear=True):
+        chain = resolve_chain(Tier.HIGH, credentials)
+        models = collect_requested_models(env)
+    # Then the selected shared model has a registered route.
+    assert chain == ["compat/vendor/shared"]
+    assert set(chain) <= models
+
+
+@pytest.mark.parametrize("explicit_gateway_first", [False, True])
+def test_compat_gateway_respects_provider_priority(explicit_gateway_first: bool) -> None:
+    from decepticon.llm.factory import auth_inventory
+    from decepticon_core.types.llm import AuthMethod
+
+    # Given both a standard provider and the optional gateway.
+    env = {
+        "OPENAI_API_KEY": "sk-" + "b" * 24,
+        "OPENAI_COMPAT_GATEWAY_API_BASE": "http://127.0.0.1:8080/v1",
+        "OPENAI_COMPAT_GATEWAY_API_KEY": "sk-compat-" + "a" * 24,
+        "OPENAI_COMPAT_GATEWAY_MODEL": "vendor/model",
+    }
+    expected = (AuthMethod.OPENAI_API, AuthMethod.OPENAI_COMPAT_GATEWAY_API)
+    if explicit_gateway_first:
+        env["DECEPTICON_AUTH_PRIORITY"] = "openai_compat_gateway_api,openai_api"
+        expected = tuple(reversed(expected))
+    # When credential priority is resolved.
+    with patch.dict(os.environ, env, clear=True):
+        chain = auth_inventory().resolved_chain
+    # Then default and explicit ordering are honored.
+    assert chain == expected
+
+
+def test_subscription_routes_forward_effort_to_their_custom_handlers() -> None:
+    config = yaml.safe_load((_MODULE_PATH.parent / "litellm.yaml").read_text())
+    merged = merge_dynamic_models(config, {"DECEPTICON_AUTH_CHATGPT": "true"})
+    checked = set()
+    for route in merged["model_list"]:
+        params = route["litellm_params"]
+        model = params.get("model", "")
+        if model.startswith(("codex-oauth/oauth-gpt-", "auth/claude-")):
+            assert "reasoning_effort" in params.get("allowed_openai_params", []), model
+            checked.add(model.split("/")[0])
+    assert checked == {"codex-oauth", "auth"}
+    # Claude-only installs may use the base YAML without dynamic generation.
+    for route in config["model_list"]:
+        params = route["litellm_params"]
+        if params.get("model", "").startswith("auth/claude-"):
+            assert "reasoning_effort" in params.get("allowed_openai_params", [])
+    assert not merged.get("litellm_settings", {}).get("drop_params", False)

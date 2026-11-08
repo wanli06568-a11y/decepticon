@@ -3,6 +3,8 @@ name: contact-template
 description: "Contact / communications plan generator — primary operator, escalation chain, abort signal recipient, external SOC endpoint, blackout windows."
 allowed-tools: Read Write Edit
 metadata:
+  skillogy:
+    version: 1
   subdomain: planning
   when_to_use: "create contact plan, communications plan, escalation chain, operator contacts, SOC notification, blackout window"
   tags: contact, communications, escalation, soc, deconfliction, blackout
@@ -80,3 +82,27 @@ Before writing `plan/contact.json`:
 ## Output
 
 Write to `plan/contact.json` validating against `decepticon.core.schemas.ContactPlan`.
+
+## Document schema (derived from the validator's model)
+
+`plan/contact.json` must validate against `ContactPlan`. Fields not listed here are not part of the model and are ignored by the validator.
+
+| field | type | required | allowed values / nested keys |
+| --- | --- | --- | --- |
+| `engagement_name` | str | yes |  |
+| `primary_operator` | Contact | yes | each object: `name`, `role`, `channel`, `availability` |
+| `escalation_chain` | list[Contact] | no | each object: `name`, `role`, `channel`, `availability` |
+| `abort_signal_recipient` | Contact \| None | no | each object: `name`, `role`, `channel`, `availability` |
+| `external_soc_endpoint` | str | no |  |
+| `blackout_windows` | list[str] | no |  |
+| `version` | str | no |  |
+| `last_updated` | str | no |  |
+
+`Contact` object:
+
+| field | type | required | allowed values |
+| --- | --- | --- | --- |
+| `name` | str | yes |  |
+| `role` | str | yes |  |
+| `channel` | str | yes |  |
+| `availability` | str | no |  |

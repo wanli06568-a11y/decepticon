@@ -3,6 +3,8 @@ name: data-handling-template
 description: "Data handling plan generator — evidence retention, encryption, chain-of-custody, compliance frameworks (GDPR / HIPAA / PCI-DSS / SOC2)."
 allowed-tools: Read Write Edit
 metadata:
+  skillogy:
+    version: 1
   subdomain: planning
   when_to_use: "create data handling plan, evidence retention, chain-of-custody, GDPR, HIPAA, PCI-DSS, compliance, PII handling"
   tags: data-handling, evidence, retention, encryption, chain-of-custody, compliance, gdpr, hipaa
@@ -70,3 +72,29 @@ Before writing `plan/data-handling.json`:
 ## Output
 
 Write to `plan/data-handling.json` validating against `decepticon.core.schemas.DataHandlingPlan`.
+
+## Document schema (derived from the validator's model)
+
+`plan/data-handling.json` must validate against `DataHandlingPlan`. Fields not listed here are not part of the model and are ignored by the validator.
+
+| field | type | required | allowed values / nested keys |
+| --- | --- | --- | --- |
+| `engagement_name` | str | yes |  |
+| `data_classes` | list[DataClass] | no | each object: `name`, `classification`, `retention_days`, `encryption_at_rest`, `encryption_in_transit`, `handling_notes` |
+| `evidence_storage_path` | str | no |  |
+| `chain_of_custody` | bool | no |  |
+| `purge_after_days` | int | no | >= 0 |
+| `compliance_frameworks` | list[str] | no |  |
+| `version` | str | no |  |
+| `last_updated` | str | no |  |
+
+`DataClass` object:
+
+| field | type | required | allowed values |
+| --- | --- | --- | --- |
+| `name` | str | yes |  |
+| `classification` | str | yes |  |
+| `retention_days` | int | yes | >= 0 |
+| `encryption_at_rest` | bool | no |  |
+| `encryption_in_transit` | bool | no |  |
+| `handling_notes` | str | no |  |

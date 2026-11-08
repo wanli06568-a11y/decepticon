@@ -15,8 +15,11 @@ red-team run never blocks the calling agent's tool call.
 from __future__ import annotations
 
 import json
+import os
+import re
 from collections.abc import Sequence
-from typing import Any
+from pathlib import Path
+from typing import Any, assert_never
 
 from decepticon.mcp_server.config import ServerConfig
 from decepticon.mcp_server.models import (
@@ -28,11 +31,33 @@ from decepticon.mcp_server.models import (
     StreamEvent,
 )
 from decepticon.mcp_server.streaming import watch_run
+from decepticon.workflows.models import WorkflowError
+from decepticon_core.registry.roles import RoleRegistry, default_role_purpose
 from decepticon_core.utils.logging import get_logger
 
 log = get_logger("mcp_server.engagements")
 
 _ACTIVE_STATUSES = frozenset({"pending", "running"})
+
+
+def _workflow_config(
+    workflow_id: str | None,
+    workflow_version: str | None,
+    prefix: str = "",
+) -> dict[str, str]:
+    """Validate selector syntax; the target server owns catalog and purpose resolution."""
+    if workflow_version is not None and workflow_id is None:
+        raise WorkflowError(f"{prefix}workflow_version requires {prefix}workflow_id")
+    selected: dict[str, str] = {}
+    if workflow_id is not None:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,127}", workflow_id):
+            raise WorkflowError(f"invalid {prefix}workflow_id")
+        selected[f"{prefix}workflow_id"] = workflow_id
+    if workflow_version is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", workflow_version):
+            raise WorkflowError(f"invalid {prefix}workflow_version")
+        selected[f"{prefix}workflow_version"] = workflow_version
+    return selected
 
 
 def _split_model_command(message: str) -> tuple[str | None, str]:
@@ -73,9 +98,24 @@ class EngagementClient:
         return self._client
 
     async def list_graphs(self) -> list[GraphInfo]:
-        """Return the engagement graphs (assistants) the connected server exposes."""
+        """Return the engagement graphs (assistants) the connected server exposes.
+
+        Pages through ``assistants.search`` to the end. The LangGraph SDK
+        defaults to ``limit=10``, so a single call silently truncated installs
+        that expose more than ten graphs (the OSS ``standard`` bundle alone
+        ships 22), hiding agents such as ``recon``, ``soundwave`` and the
+        ``decepticon`` orchestrator from callers.
+        """
         client = self._ensure_client()
-        assistants = await client.assistants.search()
+        page_size = 100
+        assistants: list[Any] = []
+        offset = 0
+        while True:
+            page = await client.assistants.search(limit=page_size, offset=offset)
+            assistants.extend(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
         return [
             GraphInfo(
                 assistant_id=str(entry.get("assistant_id", "")),
@@ -123,8 +163,17 @@ class EngagementClient:
         scan_mode: ScanMode,
         engagement_name: str,
         assistant: str,
+        workflow_id: str | None = None,
+        workflow_version: str | None = None,
+        workspace_path: str = "/workspace",
     ) -> StartResult:
         """Dispatch a background engagement run and return its handle."""
+        if workspace_path != "/workspace" and Path(workspace_path).name != engagement_name:
+            raise ValueError(
+                f"workspace_path {workspace_path!r} is not bound to engagement "
+                f"{engagement_name!r}; a non-default workspace must be the "
+                "engagement's own directory (ending in /<engagement_name>)"
+            )
         scope_payload: dict[str, Any] = {
             "targets": list(targets),
             "scope_mode": "full",
@@ -133,8 +182,30 @@ class EngagementClient:
             "instruction": instruction,
         }
         run_config: dict[str, Any] = {
-            "configurable": {"engagement_name": engagement_name, "scan_mode": scan_mode},
+            "configurable": {
+                "engagement_name": engagement_name,
+                "workspace_path": workspace_path,
+                "scan_mode": scan_mode,
+            },
         }
+
+        role = RoleRegistry.get(assistant)
+        purpose = role.purpose if role else default_role_purpose(assistant)
+        match purpose:
+            case "planning":
+                run_config["configurable"].update(
+                    _workflow_config(
+                        os.environ.get("DECEPTICON_PLANNING_WORKFLOW_ID") or None,
+                        os.environ.get("DECEPTICON_PLANNING_WORKFLOW_VERSION") or None,
+                        "planning_",
+                    )
+                )
+            case "execution":
+                run_config["configurable"].update(_workflow_config(workflow_id, workflow_version))
+            case "observation":
+                pass
+            case unreachable:
+                assert_never(unreachable)
 
         client = self._ensure_client()
         thread = await client.threads.create()
@@ -142,7 +213,7 @@ class EngagementClient:
         run = await client.runs.create(
             thread_id,
             assistant_id=assistant,
-            input=_engagement_input(scope_payload, engagement_name),
+            input=_engagement_input(scope_payload, engagement_name, workspace_path),
             config=run_config,
         )
         log.info("dispatched engagement %s on thread %s", engagement_name, thread_id)
@@ -153,6 +224,7 @@ class EngagementClient:
             assistant=assistant,
             status=str(run.get("status", "pending")),
             langgraph_url=self._config.langgraph_url,
+            workspace_path=workspace_path,
         )
 
     async def send_message(
@@ -215,7 +287,9 @@ class EngagementClient:
         )
 
 
-def _engagement_input(scope_payload: dict[str, Any], engagement_name: str) -> dict[str, Any]:
+def _engagement_input(
+    scope_payload: dict[str, Any], engagement_name: str, workspace_path: str
+) -> dict[str, Any]:
     return {
         "messages": [
             {
@@ -227,6 +301,7 @@ def _engagement_input(scope_payload: dict[str, Any], engagement_name: str) -> di
             }
         ],
         "engagement_name": engagement_name,
+        "workspace_path": workspace_path,
         "scan_scope": scope_payload,
     }
 

@@ -1,6 +1,6 @@
 # Agents
 
-Decepticon ships a **multi-agent stack** organized by kill chain phase: three orchestrators (Decepticon, Vulnresearch, Soundwave), a roster of specialist sub-agents under Decepticon (recon → exploit → post-exploit → domain operators), the five-stage Vulnresearch pipeline (`scanner → detector → verifier → patcher → exploiter`), and the `blue_cell` defense agent for the Offensive Vaccine loop. Each agent starts with a **fresh context window** per objective — no accumulated noise, no context degradation. Findings persist to disk (`workspace/`) and the knowledge graph, not agent memory.
+Decepticon combines stable specialist capabilities with selected business workflows. Decepticon owns execution OPPLAN, Soundwave is an optional standalone planner, and the optional Vulnresearch plugin retains its separate legacy pipeline. Blue Cell investigates local sensor evidence; the broader Offensive Vaccine loop remains planned. See the [extension contract](design/extension-contract.md). Each agent starts with a **fresh context window** per objective — no accumulated noise, no context degradation. Findings persist to disk (`workspace/`) and the knowledge graph, not agent memory.
 
 ---
 
@@ -10,9 +10,23 @@ Decepticon ships a **multi-agent stack** organized by kill chain phase: three or
 
 | Agent | Role |
 |-------|------|
-| **Decepticon** | Main red-team orchestrator. Reads the OPPLAN, dispatches objectives to specialist sub-agents, and tracks status transitions. Sub-agents: `recon`, `exploit`, `postexploit`, `analyst`, `reverser`, `contract_auditor`, `cloud_hunter`, `ad_operator`, `phisher`, `mobile_operator`, `wireless_operator`, `osint_operator`, `iot_operator`, `ics_operator`, `forensicator`, `supply_chain_operator`. |
+| **Decepticon** | Main red-team orchestrator. Reads the OPPLAN, dispatches objectives to specialist sub-agents, and tracks status transitions. Sub-agents: `recon`, `exploit`, `postexploit`, `analyst`, `reverser`, `contract_auditor`, `cloud_hunter`, `ad_operator`, `phisher`, `mobile_operator`, `wireless_operator`, `osint_operator`, `iot_operator`, `ics_operator`, `forensicator`, `supply_chain_operator`, `finding_verifier`, `finding_reporter`. |
 | **Vulnresearch** | Vulnerability research orchestrator — runs the five-stage pipeline (`scanner → detector → verifier → patcher → exploiter`) with state passed between stages exclusively through the knowledge graph. |
-| **Soundwave** | Engagement planner. Standalone graph (not a sub-agent of Decepticon). Interviews the operator and writes the eight-document engagement bundle — RoE, Threat Profile, CONOPS, Deconfliction, Contact, Data Handling, Abort, Cleanup. The orchestrator builds the OPPLAN. |
+| **Soundwave** | Engagement planner. Standalone graph (not a sub-agent of Decepticon). Uses an optional planning workflow to discuss and prepare seven documents alongside the operator-provisioned, read-only RoE. Publication does not switch to Red. The execution orchestrator builds OPPLAN. |
+
+### Additional standard and optional graphs
+
+- `autohunt` is a separately registered bootstrap planner, reusing Soundwave's
+  document-only contracts. It is not a mandatory precondition for normal Red.
+- `finding_verifier` independently adjudicates findings using reproduction and
+  equivalent negative controls. `finding_reporter` writes the canonical report
+  after verification; it has no shell tool.
+- Blue mode selects the external AutoBot `autobot` graph when its package and
+  sensor are configured. It is not a built-in Decepticon blue_cell factory.
+
+The current [graph registry](../packages/decepticon/decepticon/graph_registry.py)
+and package entry points define availability; a fixed historical agent count is
+not a discovery API.
 
 ### Reconnaissance
 
@@ -46,7 +60,7 @@ Sub-agents of the **Vulnresearch** orchestrator. State flows between stages via 
 | **AD Operator** | Active Directory attacks — Kerberoasting, AS-REP roasting, ADCS ESC1-ESC15, DCSync, BloodHound path analysis. |
 | **Cloud Hunter** | Cloud infrastructure attacks — IAM privilege escalation, S3 bucket exposure, Kubernetes RBAC escapes, metadata service abuse. |
 | **Contract Auditor** | Solidity / EVM smart contract audits — reentrancy, oracle manipulation, flash loan abuse, access control. |
-| **Reverser** | Binary analysis and reverse engineering — ELF/PE/Mach-O triage, packer detection, ROP gadget inventories, Ghidra/radare2 recon. |
+| **Reverser** | Binary analysis and reverse engineering — ELF/PE/Mach-O triage, packer detection, ROP gadget inventories, and REA/Ghidra static analysis when its optional workload is configured. [REA reversing](features/rea-reversing.md). |
 | **Analyst** | Vulnerability research and reporting — source code review, static analysis (semgrep/bandit/gitleaks), dependency CVE sweeps, multi-hop exploit chain construction. |
 | **Phisher** | Initial-access via phishing / social engineering (MITRE T1566.\*) — GoPhish campaigns, evilginx2 MFA-bypass token capture, M365/O365 OAuth device-code harvest, lookalike domains, pretext engineering. Mandatory lure deconfliction with the blue team before sending. |
 | **Mobile Operator** | Android / iOS application attacks — static analysis (apktool/jadx/class-dump), dynamic instrumentation (frida/objection), SSL pinning + root/jailbreak bypass, exported-component abuse, WebView JS bridge exploitation, MobSF. |
@@ -82,7 +96,7 @@ These slots are part of the base set every role receives — they are the engage
 
 | Middleware | Slot | Purpose |
 |------------|------|---------|
-| `RoEGuardrailMiddleware` | `roe-guardrail` | Legal/safety gate on tool calls — extracts the target, evaluates it against the Rules of Engagement, and appends to a chained audit log (`<workspace>/audit/roe-decisions.jsonl`, or `DECEPTICON_ROE_AUDIT_PATH`). A fast-fail command-parse gate; the authoritative scope boundary is the egress layer (sandbox nftables, on by default for `enforce` mode, opt-out via `DECEPTICON_EGRESS_DISABLE`). The pre-rename name `RoEEnforcementMiddleware` / slot `roe-enforcement` stays as a compat alias until 2.0.0. |
+| `RoEGuardrailMiddleware` | `roe-guardrail` | Legal/safety gate on tool calls — extracts the target, evaluates it against the Rules of Engagement, and appends to a chained audit log (`<workspace>/audit/roe-decisions.jsonl`, or `DECEPTICON_ROE_AUDIT_PATH`). A best-effort command-parse gate plus a separate egress-policy provisioning attempt. Verify applied daemon policy; provisioning failures do not stop the run. The class/enum compatibility aliases remain in source; no removal at 2.0.0 occurred. Missing machine configuration is refused; legacy audit/warn mode keys are ignored. |
 | `UntrustedOutputMiddleware` | `untrusted-output` | Quarantines attacker-influenceable tool output (bash stdout, file reads, KG queries) inside a `<UNTRUSTED_TOOL_OUTPUT>` envelope so hostile content can't re-author the agent's instructions. |
 | `PromptInjectionShieldMiddleware` | `prompt-injection-shield` | Deny-list wrap of attacker-controlled tool output (HTTP bodies, banners, file reads); dedups against `UNTRUSTED_OUTPUT` and does not re-inject the system policy. |
 | `EventLogMiddleware` | `event-log` | Structured event logging for every model and tool call. |
@@ -104,7 +118,7 @@ Bash-executing agents and the orchestrator additionally get:
 | `FilesystemMiddleware` | `filesystem` | Provides `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep` tools backed by the sandbox filesystem. Execute is intentionally stripped — agents use the dedicated `bash` tool for command execution. |
 | `SubAgentMiddleware` | `subagent` | Allows orchestrators (Decepticon, Vulnresearch) to delegate objectives to specialist sub-agents via the `task()` tool. |
 | `OPPLANMiddleware` | `opplan` | Injects the current OPPLAN progress table into every LLM call and provides CRUD tools for objective management. |
-| `ModelOverrideMiddleware` | `model-override` | Per-objective model selection. Orchestrator only. |
+| `ModelOverrideMiddleware` | `model-override` | Session/per-objective model selection; included in the common tail slots. |
 | `ModelFallbackMiddleware` | `model-fallback` | Switches to a fallback model on provider outage, rate limit, or context overflow. Conditional — skipped when no fallback chain is configured. |
 | `SummarizationMiddleware` | `summarization` | Auto-compacts conversation history when the context window approaches capacity. |
 | `AnthropicPromptCachingMiddleware` | `prompt-caching` | Caches static system prompt content for Anthropic models to reduce token costs. Silently no-ops on non-Anthropic providers. |
@@ -112,47 +126,30 @@ Bash-executing agents and the orchestrator additionally get:
 
 ### Safety-critical slots
 
-`SAFETY_CRITICAL_SLOTS` — `engagement-context`, `roe-guardrail`, `untrusted-output`, `prompt-injection-shield`, `sandbox-notification`, `hitl-approval` — can only be replaced or disabled by a plugin when `DECEPTICON_ALLOW_SAFETY_OVERRIDES=1` is set in the environment. The gate is enforced by `build_middleware` in `decepticon.agents.build`; without it, an override raises `SafetyOverrideViolation`. Replacement is fine if the new middleware honours the same contract — the gate exists so an accidentally-installed plugin can't silently subvert the safety story.
+`SAFETY_CRITICAL_SLOTS` — `engagement-context`, `roe-guardrail`, `untrusted-output`, `prompt-injection-shield`, `sandbox-notification`, `opscontrol-notification`, `hitl-approval` — can only be replaced or disabled by a plugin when `DECEPTICON_ALLOW_SAFETY_OVERRIDES=1` is set in the environment. The gate is enforced by `build_middleware` in `decepticon.agents.build`; without it, an override raises `SafetyOverrideViolation`. Replacement is fine if the new middleware honours the same contract — the gate exists so an accidentally-installed plugin can't silently subvert the safety story.
 
-### Stack per Agent Role
+### Assembly and role differences
 
-Each diagram lists the slots a role instantiates, in `MiddlewareSlot` enum order (the order they wrap each call). `HITLApproval` appears in the bash-agent and orchestrator stacks but is opt-in — skipped at runtime unless `DECEPTICON_HITL__ENABLED` is truthy.
+The [slot map](../packages/decepticon-core/decepticon_core/contracts/slots.py)
+and [default factories](../packages/decepticon/decepticon/agents/middleware_slots.py)
+are the current assembly contract. Older diagrams omitted KG, opscontrol
+notifications, proxy-key overrides and model overrides on specialists.
 
-**Decepticon (Orchestrator)** — full stack with engagement context, sub-agent dispatch, and per-objective model override. No `SandboxNotification`.
+| Role family | Distinct slots/behavior |
+| --- | --- |
+| Decepticon | Engagement context, subagent dispatch, OPPLAN, optional HITL and opscontrol notifications |
+| Bash specialists | Engagement context, sandbox notifications and optional HITL |
+| Analyst, AD Operator, Contract Auditor | Bash specialist stack plus conditional KG middleware |
+| Soundwave and finding reporter | Engagement context without bash/HITL/sandbox notifications |
+| Vulnresearch | Common stack plus subagent dispatch and OPPLAN |
+| Detector | Common read-only stack without bash/engagement context |
 
-```
-EngagementContext → RoEEnforcement → HITLApproval → UntrustedOutput → PromptInjectionShield
-                  → Skills → Filesystem → SubAgent → OPPLAN → EventLog → Budget → ModelOverride
-                  → ModelFallback → Summarization → AnthropicPromptCaching → PatchToolCalls
-```
+Common tail slots include model override/fallback, per-run proxy-key override,
+summarization, prompt caching and tool-call repair. Individual factories may add
+middleware such as StepBudget beyond slot assembly. Skillogy normally replaces
+the local SkillsMiddleware through `maybe_install_skillogy`; an explicit opt-out
+retains local skill reads. See [Skillogy](skillogy.md).
 
-**Vulnresearch (Orchestrator)** — base + sub-agent dispatch. No `EngagementContext` (it consumes its parent's context), no `ModelOverride`, no `HITLApproval`, no `SandboxNotification`.
-
-```
-RoEEnforcement → UntrustedOutput → PromptInjectionShield → Skills → Filesystem → SubAgent → OPPLAN
-              → EventLog → Budget → ModelFallback → Summarization → AnthropicPromptCaching → PatchToolCalls
-```
-
-**Bash-executing specialists** (Recon, Exploit, Post-Exploit, Analyst, Reverser, Contract Auditor, Cloud Hunter, AD Operator, Phisher, Mobile Operator, Wireless Operator — and the plugin specialists Verifier, Patcher, Scanner, Exploiter) — the full bash-agent stack including `EngagementContext` and `SandboxNotification`.
-
-```
-EngagementContext → RoEEnforcement → HITLApproval → UntrustedOutput → PromptInjectionShield
-                  → Skills → Filesystem → EventLog → SandboxNotification → Budget
-                  → ModelFallback → Summarization → AnthropicPromptCaching → PatchToolCalls
-```
-
-These specialists also have the `bash` tool for command execution inside the sandbox; `FilesystemMiddleware` covers all file I/O.
-
-**Detector (read-only plugin specialist)** — base set only. No `bash`, no `EngagementContext`, no `SandboxNotification`, no `HITLApproval`.
-
-```
-RoEEnforcement → UntrustedOutput → PromptInjectionShield → Skills → Filesystem → EventLog → Budget
-              → ModelFallback → Summarization → AnthropicPromptCaching → PatchToolCalls
-```
-
-**Soundwave (Planner)** — base set + `EngagementContext`. No `bash`, no sub-agents, no `SandboxNotification`, no `HITLApproval` (document generation only).
-
-```
-EngagementContext → RoEEnforcement → UntrustedOutput → PromptInjectionShield → Skills → Filesystem
-                  → EventLog → Budget → ModelFallback → Summarization → AnthropicPromptCaching → PatchToolCalls
-```
+The legacy `blue_cell` slot definition is not proof of an installed Blue graph;
+current Blue runtime ownership is [AutoBot](features/blue-cell.md). Runtime tool
+availability, workflow pins and authorization must be checked on the actual role.

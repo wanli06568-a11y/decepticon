@@ -1,3 +1,9 @@
+export interface ChoicePickerRequest {
+  readonly title: string;
+  readonly options: readonly { readonly label: string; readonly value: string; readonly description?: string }[];
+  readonly onSelect: (value: string) => void | Promise<void>;
+}
+
 /**
  * Command type definitions for the Decepticon CLI slash command system.
  *
@@ -7,13 +13,19 @@
 
 /** Context passed to command handlers. */
 export interface CommandContext {
+  readonly openPicker?: (request: ChoicePickerRequest) => void;
+  readonly runLocalCommand?: (name: "status" | "doctor" | "sessions" | "export" | "queue" | "alerts", args: string) => void | Promise<void>;
   /** Add a system event to the activity stream. */
   addSystemEvent: (content: string) => void;
   /** Clear all events from the activity stream. */
   clearEvents: () => void;
   /** Submit a message to the agent. */
   submit: (input: string) => void;
-  /** Resume a paused run with optional feedback. */
+  selectAssistant?: (assistantId: string, commit?: () => Promise<void>) => boolean | Promise<boolean>;
+  mutateWorkspace?: (commit: () => Promise<void>) => Promise<boolean>;
+  restoreSession?: (threadId: string) => void;
+  terminalCommand?: (name: "tui" | "mouse", value: string) => void;
+  /** Resume a paused run with optional feedback (internal lifecycle). */
   resume: (value?: string) => void;
   /** Exit the application. */
   exit: () => void;
@@ -27,6 +39,7 @@ export interface CommandResult {
 
 /** A slash command definition. */
 export interface Command {
+  readonly complete?: (args: string) => readonly string[];
   /** Internal name used for lookup (e.g. "help"). */
   name: string;
   /** User-facing description shown in autocomplete and /help. */

@@ -1,10 +1,9 @@
 """Decepticon — autonomous red team coordinator agent.
 
-Engagement-ready agent that builds the OPPLAN from existing RoE/CONOPS
-documents and executes the kill chain by delegating to specialist sub-agents.
-The launcher selects this assistant when the operator picks an existing
-engagement; for fresh engagements it picks the standalone soundwave assistant
-instead, which writes the planning documents this agent then consumes.
+Engagement-ready agent that builds the OPPLAN from an approved RoE and optional
+Plan documents, then executes the kill chain by delegating to specialist
+sub-agents. The launcher selects this assistant for Red mode, including fresh
+direct-scope engagements. Soundwave is selected only for optional Plan mode.
 
 Middleware stack (selected for orchestration):
   1. EngagementContextMiddleware — inject engagement metadata (slug, target, RoE)
@@ -48,12 +47,13 @@ cleanly:
 
 SubAgent / OPPLAN (orchestrator — delegates all work via task()).
 No SandboxNotification (bash lives on sub-agents). Soundwave is NOT a
-sub-agent: the launcher routes to its standalone assistant when document
-generation is needed.
+sub-agent: the launcher routes to its standalone assistant in Plan mode.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 from deepagents.middleware.subagents import CompiledSubAgent
@@ -64,6 +64,7 @@ from decepticon.agents.prompts import load_prompt
 from decepticon.backends import build_sandbox_backend, make_agent_backend
 from decepticon.core.subagent_streaming import StreamingRunnable
 from decepticon.llm import LLMFactory
+from decepticon.middleware.step_budget import StepBudgetMiddleware, effective_recursion_limit
 from decepticon_core.plugin_loader import (
     is_bundle_enabled,
     load_plugin_callbacks,
@@ -71,7 +72,36 @@ from decepticon_core.plugin_loader import (
 )
 
 _ROLE = "decepticon"
-_RECURSION_LIMIT = 400
+
+logger = logging.getLogger(__name__)
+
+
+def _recursion_limit_from_env() -> int:
+    """Operator-tunable agent step budget (``DECEPTICON_RECURSION_LIMIT``).
+
+    Source of truth for both the LangGraph ``recursion_limit`` config and the
+    StepBudgetMiddleware budget. Editing the constant in a source checkout is
+    easy to miss (issue #1145: an operator rebuilt after editing it and saw no
+    effect); the env var flows through the launcher's ``env_file`` instead.
+    """
+    raw = os.environ.get("DECEPTICON_RECURSION_LIMIT", "").strip()
+    if not raw:
+        return 2000
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("invalid DECEPTICON_RECURSION_LIMIT=%r — using the default 2000", raw)
+        return 2000
+    if value < 25:
+        logger.warning(
+            "DECEPTICON_RECURSION_LIMIT=%d below LangGraph's own floor (25) — clamping",
+            value,
+        )
+        return 25
+    return value
+
+
+_RECURSION_LIMIT = _recursion_limit_from_env()
 
 
 def create_decepticon_agent(
@@ -143,14 +173,26 @@ def create_decepticon_agent(
     # (UIRenderer) and LangGraph Platform HTTP API (get_stream_writer →
     # custom events).
     if subagents is None:
-        subagents = [
-            CompiledSubAgent(
-                name=spec.name,
-                description=spec.description,
-                runnable=StreamingRunnable(spec.factory(), spec.name),
-            )
-            for spec in load_subagents_for_parent(_ROLE)
-        ]
+        # Optional subagent packages (e.g. the AutoBot defender) degrade
+        # gracefully: a subagent whose factory raises (missing model env,
+        # absent optional dep) is skipped with a warning — never the parent
+        # agent. The purple loop activates when the package is configured.
+        subagents = []
+        for spec in load_subagents_for_parent(_ROLE):
+            try:
+                subagents.append(
+                    CompiledSubAgent(
+                        name=spec.name,
+                        description=spec.description,
+                        runnable=StreamingRunnable(spec.factory(), spec.name),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - optional capability
+                logger.warning(
+                    "subagent %r skipped (optional capability unavailable): %s",
+                    spec.name,
+                    exc,
+                )
 
     if tools is None:
         # The orchestrator's domain tools are ``{}`` — all offensive
@@ -188,11 +230,14 @@ def create_decepticon_agent(
         llm,
         system_prompt=system_prompt,
         tools=tools,
-        middleware=middleware,
+        middleware=[
+            *middleware,
+            StepBudgetMiddleware(total_steps=recursion_limit or _RECURSION_LIMIT),
+        ],
         name=_ROLE,
     ).with_config(
         {
-            "recursion_limit": recursion_limit or _RECURSION_LIMIT,
+            "recursion_limit": effective_recursion_limit(recursion_limit or _RECURSION_LIMIT),
             "callbacks": load_plugin_callbacks(role=_ROLE, backend=backend),
         }
     )

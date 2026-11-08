@@ -61,15 +61,42 @@ From the terminal UI, run `/web` (or `/web up`) to start the dashboard. It is th
 ## First Real Engagement
 
 1. Launch Decepticon (`decepticon`). To use the browser UI, run `/web` and open <http://localhost:3000>.
-2. The **Soundwave** agent interviews you to define the engagement:
-   - Target scope (IP range, URL, Git repo, file upload, or local path)
-   - Threat actor profile
-   - Rules of Engagement (authorized scope, timing, exclusions)
-3. Soundwave writes the eight-document engagement bundle (RoE, Threat Profile, CONOPS, Deconfliction, Contact, Data Handling, Abort, Cleanup)
-4. The orchestrator builds the OPPLAN from the bundle — you review and approve it
-5. The autonomous loop begins
+2. In the CLI, choose **New engagement**, enter its name, in-scope targets and exclusions, then review the normalized scope. Optional discovery suggestions are included only when selected. The launcher writes the machine RoE and opens Red. No prewritten scope file or Plan session is required for this path. For an existing engagement with missing scope, import a reviewed RoE with `/scope import <file> --confirm`. There is no separate `/mode red approve` command. The web dashboard uses its own engagement setup form.
+3. Direct approved Red does not require planning documents. Use `/plan` (or `/mode plan`) explicitly for optional Soundwave discussion and planning, then send your planning message; publication leaves you in Plan. See [engagement workflow](engagement-workflow.md) and [RoE provisioning](roe-provisioning.md).
+4. Use `/mode plan`, `/mode red`, or `/mode blue` within the CLI session, or the web live-view selector. Red runs specialist operations under the approved RoE; Blue investigation needs a connected local sensor.
+
+The CLI accepts network targets such as domains, URLs, IPs/CIDRs and supported
+globs, normalizes them to host-level scope, and previews dropped or expanded
+entries. The web form has a separate stricter root-URL/IP-range validator;
+its constraints are not the CLI's target contract. See
+[engagement workflow](engagement-workflow.md) and [RoE provisioning](roe-provisioning.md).
 
 > **Important**: Only run Decepticon against systems you own or have explicit written authorization to test. See the disclaimer in the main README.
+
+### Find your way around the chat
+
+Type `/` for the command menu, use Up/Down to select, and Enter to execute; Tab
+completes a command. `/help` lists commands and aliases; `/shortcuts` lists keys.
+
+| Task | Command |
+|------|---------|
+| Inspect version, session and connections | `/version`, `/status` |
+| Check target workspace versus CLI directory | `/pwd` |
+| Select a configured model | `/model` |
+| Continue paused work or browse saved conversations | `/resume`, `/sessions` |
+| Review or clear waiting messages | `/queue`, `/queue clear` |
+| Start a fresh conversation in the same engagement and mode | `/new` |
+| Leave the chat without stopping services | `/quit` or `/exit` |
+
+`/new` accepts no arguments and requires idle state with no waiting messages.
+Finish or cancel active/paused work first. It preserves saved conversations and
+terminal scrollback. It does not create a new engagement. Leaving the chat
+disconnects its stream; waiting local messages are not submitted after exit.
+
+This guide describes current `main`; some controls are unreleased. Check
+[version history](../CHAGELOG.md) and [upgrade behavior](cli-experience.md#upgrade-behavior)
+against your installed version. See the [full command reference](cli-reference.md#slash-commands)
+for aliases and Blue sensor commands.
 
 ---
 

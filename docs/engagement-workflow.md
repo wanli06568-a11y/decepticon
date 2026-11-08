@@ -1,166 +1,98 @@
-# Engagement Workflow
+# Engagement workflow
 
-A Decepticon engagement runs in two phases: **Planning** (operator + Soundwave) and **Execution** (autonomous loop). Here's the complete flow from first launch to final report.
+Red executes operator-approved scope. Optional Plan uses Soundwave for discussion
+and planning documents; Blue investigates a connected local sensor. A business
+workflow selects the execution process independently of mode and authorization.
+Contributors should read the [extension contract](design/extension-contract.md).
 
----
+Use `/mode` for a searchable selector. Blue monitoring continues independently of the selected conversation.
 
-## Phase 1: Planning
+## Start an engagement
 
-### 1. Define the target
+The CLI starts in Red. Creation asks for a name, in-scope targets and exclusions.
+The launcher normalizes targets and shows the exact resulting scope for review.
+Passive discovery may offer suggestions; only operator-selected additions join
+the scope. It writes `plan/roe.json` with machine rules and a seven-day authorized
+window. Targets are network assets; host normalization does not enforce a URL
+path or port as a separate permission.
 
-When you start a new engagement, Soundwave asks for the target. Five input types are supported:
+Creation is the scope authorization input. There is no `.red-approved` marker,
+`/mode red approve` command or required Plan bundle. Saved scopes are not
+rewritten by creation. For an existing workspace with missing scope, use the
+create-only [operator importer](roe-provisioning.md). Changing an existing
+scope remains a separate operator task; switching mode does not broaden it.
 
-| Type | Example |
-|------|---------|
-| IP range | `192.168.1.0/24`, `10.0.0.1-10.0.0.50` |
-| Web URL | `https://app.example.com` |
-| Git repository | `https://github.com/org/repo` |
-| File upload | Upload a binary, archive, or source tree |
-| Local path | `/path/to/target/app` |
+The web form has its own root-HTTP(S)-URL/default-port or IP/CIDR validator and
+writes a minimal machine scope. Its generated document does not include the
+launcher's seven-day window. Do not describe the CLI and web creation schemas
+as identical. The runtime refuses missing machine configuration regardless of
+which surface created the thread.
 
-### 2. Soundwave interview
+## Optional Plan
 
-Soundwave conducts a structured interview to understand the engagement:
-
-- **Threat actor profile** — Who are we emulating? Nation-state, financially motivated, insider threat?
-- **Authorized scope** — What systems, networks, and actions are in scope?
-- **Exclusions** — What must not be touched (production databases, critical services)?
-- **Testing window** — When is testing authorized?
-- **Acceptance criteria** — What does a successful engagement look like?
-- **OPSEC requirements** — Noise level, detection avoidance, logging preferences
-- **Contacts** — Operator, escalation chain, and who is paged on an emergency abort
-- **Data handling** — Whether PII, health, source-code, or business data is in play, and which compliance frameworks apply
-- **Abort triggers** — Conditions that force an emergency halt beyond the defaults
-
-The interview streams in real time — you respond to each question.
-
-### 3. Document generation
-
-From the interview, Soundwave writes an eight-document engagement bundle to
-`<engagement>/plan/` as JSON:
+Select `/mode plan` explicitly to discuss assumptions, scope constraints,
+threat profiles, objectives, contacts, deconfliction, data handling, abort or
+cleanup. A focused discussion does not require regenerating every document.
+Soundwave cannot execute offensive work or rewrite `plan/roe.json`; an authorized
+operator provisions that file. Soundwave can prepare a separate RoE candidate
+for review and seven planning documents:
 
 | Document | Contents |
-|----------|----------|
-| **RoE** (Rules of Engagement) | Authorized scope, exclusions, testing window, escalation contacts, legal authorization |
-| **Threat Profile** | MITRE-mapped adversary persona — tier, group ID, key TTPs — that drives TTP selection |
-| **CONOPS** (Concept of Operations) | Threat model and kill-chain phases, scoped to the RoE |
-| **Deconfliction Plan** | Source IPs, user-agents, time windows, and a shared code for real-time deconfliction calls with the SOC |
-| **Contact Plan** | Operator, escalation chain, and the recipient paged on an emergency abort |
-| **Data Handling Plan** | Per-class evidence retention, encryption, and chain-of-custody |
-| **Abort Plan** | Halt triggers and AI-aware safety gates (hallucination threshold, destructive-action gate) |
-| **Cleanup Plan** | Expected artifact inventory with per-phase removal commands |
+|---|---|
+| `threat-profile.json` | Adversary model and relevant techniques |
+| `conops.json` | Operational concept within the reviewed scope |
+| `deconfliction.json` | Operator identifiers and coordination |
+| `contact.json` | Contacts and escalation |
+| `data-handling.json` | Evidence handling and retention |
+| `abort.json` | Stop conditions and response |
+| `cleanup.json` | Expected artifacts and cleanup approach |
 
-The **OPPLAN** (Operations Plan) is not written by Soundwave — the orchestrator
-(Decepticon) builds it from the bundle once planning completes.
+Publication validates these seven documents plus the operator-provisioned RoE
+and records a draft-ready digest. It leaves the operator in Plan. Publication
+neither changes scope authorization nor starts execution. Review the current
+scope and explicitly select Red when ready. The execution orchestrator creates OPPLAN;
+it can do so directly from approved scope without this optional bundle.
+See [planning workflow](design/planning-workflow.md).
 
-### 4. OPPLAN structure
+## Execution workflow and OPPLAN
 
-Each OPPLAN objective carries:
+The trusted launch adapter supplies a registered execution workflow: `red-team`,
+`bug-bounty`, `pentest` or `vulnerability-research`. For example, launch with
+`decepticon start --workflow pentest --workflow-version 1` (the `start` word is
+optional). The runtime pins its full
+source, version and hash. Resumes preserve that selection; a different workflow
+requires a new execution thread. Workflows do not broaden authorized scope.
 
-```
-OBJ-001
-  title: "Port scan and service enumeration"
-  phase: recon
-  opsec_level: standard
-  mitre: [T1595, T1046]
-  depends_on: []
-  acceptance_criteria: "All open ports identified with service versions"
-  status: pending
-```
+OPPLAN is the only execution task lifecycle. The orchestrator creates bounded
+objectives, selects eligible specialists, records dependencies and inspects real
+evidence before completion. Stages are not a mandatory kill-chain ladder:
+provided source, captures or access can satisfy discovery, while missing evidence
+creates a prerequisite. Proof, independent verification and reporting retain
+their dependencies for each finding. See [OPPLAN DAG](red-team/opplan-dag.md).
 
-OPSEC levels: `loud` → `standard` → `careful` → `quiet` → `silent`
+Specialists receive fresh task context and the same pinned workflow, write their
+assigned evidence, and return outcomes. A failed tool, missing artifact or blocked
+objective is not successful coverage. With no findings, report the tested surface,
+negative results, untested coverage and limitations.
 
-Phases: `recon` → `initial-access` → `post-exploit` → `c2` → `exfiltration`
+## Modes and outputs
 
-### 5. Operator review
+Use `/mode plan`, `/mode red`, or `/mode blue` to select a conversation. Mode
+threads preserve their messages and checkpoints. Switching an active run waits
+for its pause acknowledgement; `/resume` continues a paused conversation.
+The machine scope remains enforced on gated tool calls. Blue needs a connected
+local sensor; the broader automated attack/defend/verify loop remains planned.
+See [Blue Cell](features/blue-cell.md) and [Offensive Vaccine](offensive-vaccine.md).
 
-You review the generated documents. If anything is wrong — scope is too broad, wrong threat actor, missing exclusions — you can edit the documents or ask Soundwave to regenerate sections before approving.
+| Workspace path | Owner |
+|---|---|
+| `plan/roe.json` | Operator-approved scope |
+| Other planning JSON documents | Optional Soundwave planning workflow |
+| `plan/opplan.json` | Execution orchestrator through OPPLAN tools |
+| `findings/` and evidence paths | Assigned specialist and independent verifier |
+| `report/` | Finding reports and aggregate coverage/reporting |
+| Specialist directories and `.sessions/` | Operational artifacts and session logs |
 
----
-
-## Phase 2: Execution
-
-Once the OPPLAN is approved, the autonomous loop begins.
-
-### The orchestration loop
-
-```
-while objectives remain pending:
-    obj = next_pending_objective_with_dependencies_met()
-    agent = spawn_specialist_agent(obj.phase)
-    result = agent.execute(obj, roe, findings_so_far)
-    update_opplan_status(obj, result.status)
-    append_findings_to_disk(result.findings)
-    update_knowledge_graph(result.findings)
-```
-
-**Key properties:**
-- Each agent starts with a **fresh context window** — no accumulated noise
-- Agents read prior findings from disk, not from conversation history
-- The orchestrator enforces RoE every iteration before dispatching an agent
-- Dependencies are checked before an objective starts (e.g., exploitation waits for recon)
-
-### Agent dispatch by phase
-
-| Phase | Primary agents | Specialists (if applicable) |
-|-------|---------------|---------------------------|
-| `recon` | Recon, Scanner | — |
-| `initial-access` | Exploit, Verifier, Exploiter | AD Operator, Cloud Hunter |
-| `post-exploit` | Post-Exploit | AD Operator, Reverser |
-| `c2` | Post-Exploit | — |
-| `exfiltration` | Post-Exploit, Analyst | — |
-
-### Objective status transitions
-
-```
-pending → in-progress → completed
-                     ↘ blocked
-                     ↘ cancelled
-```
-
-`blocked` means the agent could not complete the objective (patch applied, service unavailable, out of scope). The orchestrator records the reason and moves on.
-
-### Findings format
-
-Each finding is written to `workspace/findings/FIND-NNN.md`:
-
-```markdown
-# FIND-001: vsftpd 2.3.4 Backdoor (CVE-2011-2523)
-
-**Severity**: CRITICAL (CVSS 10.0)
-**Host**: 192.168.1.100
-**Service**: FTP (port 21)
-**CWE**: CWE-78 (OS Command Injection)
-**MITRE**: T1190 (Exploit Public-Facing Application)
-
-## Description
-...
-
-## Evidence
-[command output, screenshots]
-
-## Remediation
-Upgrade vsftpd to 2.3.5 or later.
-```
-
----
-
-## Phase 3: Offensive Vaccine (planned)
-
-The defense feedback loop is planned for a future implementation. See [Offensive Vaccine](offensive-vaccine.md).
-
----
-
-## Outputs
-
-Everything an engagement produces lands under its workspace directory:
-
-| Path | Contents |
-|------|----------|
-| `plan/*.json` | The planning bundle — `roe`, `threat-profile`, `conops`, `deconfliction`, `contact`, `data-handling`, `abort`, `cleanup`, plus the orchestrator's `opplan` |
-| `findings/FIND-NNN.md` | Individual vulnerability findings |
-| `recon/`, `exploit/`, `post-exploit/` | Per-phase artifacts, created lazily as agents write to them |
-| `report/` | Executive summary and technical report |
-| `.sessions/` | Per-session tmux logs |
-
-The knowledge graph retains the full attack graph for post-engagement analysis via Neo4j Browser (`http://localhost:7474`).
+[Artifact ownership](agent-file-mapping.md) and
+[file conventions](agent-file-conventions.md) describe the durable evidence
+contract. A mode label or output directory does not replace scope authorization.

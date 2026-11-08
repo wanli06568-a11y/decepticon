@@ -75,24 +75,30 @@ class TestMethodModels:
         assert m[Tier.MID] == "openai/gpt-5.4"
         assert m[Tier.LOW] == "openai/gpt-5-nano"
 
-    def test_chatgpt_oauth_uses_only_supported_subscription_models(self):
+    def test_chatgpt_oauth_uses_only_supported_subscription_models(self) -> None:
         m = METHOD_MODELS[AuthMethod.OPENAI_OAUTH]
-        assert m[Tier.HIGH] == "auth/gpt-5.5"
-        assert m[Tier.MID] == "auth/gpt-5.4"
-        assert m[Tier.LOW] == "auth/gpt-5.4-mini"
+        assert m[Tier.HIGH] == "auth/gpt-6-astra"
+        assert m[Tier.MID] == "auth/gpt-6.1-sol"
+        assert m[Tier.LOW] == "auth/gpt-6-luna"
         assert "auth/gpt-5-nano" not in m.values()
 
     def test_google_full_tier_coverage(self):
         m = METHOD_MODELS[AuthMethod.GOOGLE_API]
-        assert m[Tier.HIGH] == "gemini/gemini-2.5-pro"
-        assert m[Tier.MID] == "gemini/gemini-2.5-flash"
-        assert m[Tier.LOW] == "gemini/gemini-2.5-flash-lite"
+        assert m[Tier.HIGH] == "gemini/gemini-3.8-flash"
+        assert m[Tier.MID] == "gemini/gemini-3.8-flash"
+        assert m[Tier.LOW] == "gemini/gemini-3.5-flash-lite"
 
     def test_minimax_no_low_tier(self):
         m = METHOD_MODELS[AuthMethod.MINIMAX_API]
         assert m[Tier.HIGH] == "minimax/MiniMax-M3"
         assert m[Tier.MID] == "minimax/MiniMax-M2.7-highspeed"
         assert Tier.LOW not in m
+
+    def test_cheaper_inference_tiers(self):
+        m = METHOD_MODELS[AuthMethod.CHEAPER_INFERENCE_API]
+        assert m[Tier.HIGH] == "cheaperinference/claude-sonnet-5"
+        assert m[Tier.MID] == "cheaperinference/gpt-5.4"
+        assert m[Tier.LOW] == "cheaperinference/gpt-5.4-mini"
 
     def test_default_bedrock_models_are_registered(self):
         config = yaml.safe_load(_LITELLM_CONFIG.read_text(encoding="utf-8"))
@@ -207,10 +213,10 @@ class TestResolveChain:
         chain = resolve_chain(Tier.LOW, creds)
         assert chain == []
 
-    def test_chatgpt_oauth_low_uses_gpt_5_4_mini(self):
+    def test_chatgpt_oauth_low_uses_gpt_6_luna(self) -> None:
         creds = Credentials(methods=[AuthMethod.OPENAI_OAUTH])
         chain = resolve_chain(Tier.LOW, creds)
-        assert chain == ["auth/gpt-5.4-mini"]
+        assert chain == ["auth/gpt-6-luna"]
 
     def test_empty_credentials_returns_empty(self):
         assert resolve_chain(Tier.HIGH, Credentials()) == []
@@ -227,7 +233,7 @@ class TestResolveChain:
         assert chain == [
             "openai/gpt-5.5",
             "anthropic/claude-opus-4-8",
-            "gemini/gemini-2.5-pro",
+            "gemini/gemini-3.8-flash",
         ]
 
 
@@ -249,6 +255,7 @@ class TestGatewayChains:
         AuthMethod.ZENMUX_API,
         AuthMethod.QIANFAN_API,
         AuthMethod.CLOUDFLARE_GATEWAY_API,
+        AuthMethod.CHEAPER_INFERENCE_API,
     )
 
     def test_opencode_high_resolves_to_prefixed_alias(self):
@@ -279,6 +286,7 @@ class TestGatewayChains:
             AuthMethod.ZENMUX_API: "zenmux/",
             AuthMethod.QIANFAN_API: "qianfan/",
             AuthMethod.CLOUDFLARE_GATEWAY_API: "cfgateway/",
+            AuthMethod.CHEAPER_INFERENCE_API: "cheaperinference/",
         }
         for method, prefix in expected_prefix.items():
             creds = Credentials(methods=[method])
@@ -501,7 +509,7 @@ class TestLLMModelMapping:
         assert a.fallbacks == [
             "anthropic/claude-opus-4-8",
             "openai/gpt-5.5",
-            "gemini/gemini-2.5-pro",
+            "gemini/gemini-3.8-flash",
             "minimax/MiniMax-M3",
         ]
 
@@ -520,7 +528,7 @@ class TestLLMModelMapping:
         assert recon.primary == "anthropic/claude-haiku-4-5"
         assert recon.fallbacks == [
             "openai/gpt-5-nano",
-            "gemini/gemini-2.5-flash-lite",
+            "gemini/gemini-3.5-flash-lite",
         ]
 
     def test_from_credentials_low_tier_minimax_skipped(self):
@@ -555,7 +563,7 @@ class TestLLMModelMapping:
         assert a.primary == "anthropic/claude-opus-4-8"
         assert a.fallbacks == [
             "openai/gpt-5.5",
-            "gemini/gemini-2.5-pro",
+            "gemini/gemini-3.8-flash",
             "minimax/MiniMax-M3",
             "deepseek/deepseek-v4-pro",
             "xai/grok-4.3",
@@ -588,3 +596,38 @@ class TestProxyConfig:
         assert c.url == "http://localhost:4000"
         assert c.timeout == 120
         assert c.max_retries == 2
+
+
+# ── Generic OpenAI-compatible gateway (opt-in, #989) ────────────────────
+
+
+class TestOpenAICompatGatewayChain:
+    """Env-driven compat gateway: DEFAULT OFF, no vendor hardcoded."""
+
+    def test_unset_env_yields_empty_chain(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_COMPAT_GATEWAY_API_BASE", raising=False)
+        monkeypatch.delenv("OPENAI_COMPAT_GATEWAY_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_COMPAT_GATEWAY_MODEL", raising=False)
+        monkeypatch.delenv("OPENAI_COMPAT_GATEWAY_MODEL_HIGH", raising=False)
+        creds = Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
+        assert resolve_chain(Tier.HIGH, creds) == []
+
+    def test_shared_model_resolves_all_tiers(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL", "gpt-4o-mini")
+        creds = Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
+        for tier in (Tier.HIGH, Tier.MID, Tier.LOW):
+            assert resolve_chain(tier, creds) == ["compat/gpt-4o-mini"]
+
+    def test_per_tier_models(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL_HIGH", "big")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL_MID", "mid")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL_LOW", "small")
+        creds = Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
+        assert resolve_chain(Tier.HIGH, creds) == ["compat/big"]
+        assert resolve_chain(Tier.MID, creds) == ["compat/mid"]
+        assert resolve_chain(Tier.LOW, creds) == ["compat/small"]
+
+    def test_prefix_already_present_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL", "compat/already-prefixed")
+        creds = Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
+        assert resolve_chain(Tier.HIGH, creds) == ["compat/already-prefixed"]

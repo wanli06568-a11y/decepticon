@@ -1,30 +1,24 @@
+import { machineScopeTargets } from "@decepticon/streaming";
 import { requireAuth, AuthError } from "@/lib/auth-bridge";
 import { prisma } from "@/lib/prisma";
 import { resolveEngagementDir } from "@/lib/workspace";
 import { NextRequest, NextResponse } from "next/server";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { createHash } from "node:crypto";
 
 const WORKSPACE = process.env.WORKSPACE_PATH ?? path.join(process.env.HOME ?? "", ".decepticon", "workspace");
 
-const PLAN_DOCS = ["opplan", "conops", "roe", "deconfliction"] as const;
-const BUNDLE_DOCS = [
-  "roe.json", "threat-profile.json", "conops.json", "deconfliction.json",
-  "contact.json", "data-handling.json", "abort.json", "cleanup.json",
-] as const;
+const PLAN_DOCS = ["opplan", "roe", "threat-profile", "conops", "deconfliction",
+  "contact", "data-handling", "abort", "cleanup"] as const;
 
-async function redApproved(root: string): Promise<boolean> {
+// scopeReady reports whether the engagement carries an enforced machine scope.
+// Creating the engagement with a declared target is the authorization; the RoE
+// middleware enforces the scope on every tool call, so there is no separate
+// approval marker or plan-bundle approval step.
+async function scopeReady(root: string): Promise<boolean> {
   try {
-    const approved = (await fs.readFile(path.join(root, ".red-approved"), "utf-8")).trim();
-    const digest = createHash("sha256");
-    for (const filename of BUNDLE_DOCS) {
-      digest.update(filename);
-      digest.update("\0");
-      digest.update(await fs.readFile(path.join(root, "plan", filename)));
-      digest.update("\0");
-    }
-    return approved === digest.digest("hex");
+    const roe = JSON.parse(await fs.readFile(path.join(root, "plan", "roe.json"), "utf-8"));
+    return machineScopeTargets(roe).length > 0;
   } catch {
     return false;
   }
@@ -51,7 +45,7 @@ export async function GET(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const docs: Record<string, unknown> = { redApproved: false };
+  const docs: Record<string, unknown> = { scopeReady: false };
 
   let engagementDir: string;
   let planDir: string;
@@ -71,7 +65,7 @@ export async function GET(
     }
   }
 
-  docs.redApproved = await redApproved(engagementDir);
+  docs.scopeReady = await scopeReady(engagementDir);
 
   return NextResponse.json(docs);
 }

@@ -1,114 +1,225 @@
-import { useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { z } from "zod";
+import { readBlueCursor, writeBlueCursor } from "../utils/blueCursor.js";
 
-interface BlueNotification {
-  seq: number;
-  kind: "detected" | "assessment" | "analysis_error" | "watch_alert" | "watch_error" |
-    "coverage_gap" | "coverage_restored";
-  payload: {
-    id: string;
-    rule_id?: string;
-    severity?: string;
-    analysis?: string;
-    start_seq?: number;
-    end_seq?: number;
-    error?: string;
-    reason?: string;
-    counters?: Record<string, number>;
-    evidence?: {
-      method?: string;
-      uri?: string;
-      status?: number;
-      message_excerpt?: string;
-      event_seqs?: number[];
-    };
-  };
+const notificationSchema = z.object({
+  seq: z.number().int().nonnegative(),
+  kind: z.enum(["detected", "assessment", "analysis_error", "watch_alert", "watch_error", "coverage_gap", "coverage_restored"]),
+  payload: z.object({
+    id: z.string(), rule_id: z.string().optional(), severity: z.string().optional(),
+    analysis: z.string().optional(), start_seq: z.number().optional(), end_seq: z.number().optional(),
+    error: z.string().optional(), reason: z.string().optional(), revision: z.union([z.string(), z.number()]).optional(),
+    counters: z.record(z.string(), z.number()).optional(),
+    evidence: z.object({ method: z.string().optional(), uri: z.string().optional(), status: z.number().optional(), message_excerpt: z.string().optional(), event_seqs: z.array(z.number()).optional() }).optional(),
+  }).passthrough(),
+});
+const pageSchema = z.object({ notifications: z.array(notificationSchema), next_after: z.number().optional(), latest_seq: z.number().optional(), has_more: z.boolean() });
+export type BlueNotification = z.infer<typeof notificationSchema>;
+export interface BlueState {
+  readonly status: "connected" | "disconnected" | "unavailable";
+  readonly notifications: readonly BlueNotification[];
+  readonly unreadCount: number;
+  readonly lastSequence: number;
+  readonly collectorStatus: "unknown" | "healthy" | "gap";
+  readonly aiStatus: "unknown" | "healthy" | "error";
+  readonly error: string | null;
+}
+// Blue runs continuous observation, so the agent's autonomous assessment should
+// surface in the feed when it lands — not only when the operator asks. Inline a
+// bounded slice of the agent's reasoning; the full text stays in /alerts.
+function inlineAnalysis(analysis: string | undefined, max = 400): string {
+  if (!analysis) return "";
+  const text = analysis.trim();
+  return text.length > max ? `${text.slice(0, max)}… (/alerts)` : text;
 }
 
-interface NotificationPage {
-  notifications: BlueNotification[];
-  next_after: number;
-  has_more: boolean;
-}
-
-export function formatBlueNotification(notification: BlueNotification): string {
+export function formatBlueNotification(notification: BlueNotification, language = process.env.DECEPTICON_LANGUAGE || "en"): string {
   const { payload } = notification;
+  if (language.toLowerCase().startsWith("ko")) {
+    switch (notification.kind) {
+      case "coverage_gap": {
+        const reason = {
+          collector_restarted: "수집기가 재시작되었습니다. 수집 카운터와 최근 이벤트의 연속성을 확인하세요.",
+          receiver_state_replaced: "수신 저장소가 교체되거나 초기화되었습니다. 이전 관측 기록의 연속성을 확인하세요.",
+          collector_data_loss: "수집 과정에서 기록이 유실되었습니다. /blue metrics에서 확인하세요. 이 구간에 공격이 없었다고 판단할 수 없습니다.",
+        }[payload.reason ?? ""] ?? "수집기 또는 수신기가 응답하지 않습니다. /blue status에서 확인하세요.";
+        return `[Blue Cell] 관측 공백: ${reason}`;
+      }
+      case "coverage_restored": return "[Blue Cell] 수집기가 다시 응답합니다. 이전 관측 공백은 여전히 확인이 필요합니다.";
+      case "watch_alert": return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} 상시 감시 경보. 근거 이벤트 ${payload.evidence?.event_seqs?.join(", ") ?? "?"}, 사건 ${payload.id}.`;
+      case "watch_error": return `[Blue Cell] 이벤트 ${payload.start_seq ?? "?"}–${payload.end_seq ?? "?"} AI 감시 실패. ${payload.error ?? "감시 상태를 확인하세요."}`;
+      case "assessment": return `[Blue Cell 조사] 사건 ${payload.id}: 평가가 준비되었습니다. /alerts에서 확인하세요.`;
+      case "analysis_error": return `[Blue Cell] 사건 ${payload.id}의 자동 조사가 완료되지 않았습니다. /blue analyze로 다시 시도하세요.`;
+      default: return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} ${payload.rule_id ?? "탐지"} 감지. ` +
+        `${payload.evidence?.message_excerpt?.slice(0, 100) ?? [payload.evidence?.method, payload.evidence?.uri].filter(Boolean).join(" ")} ` +
+        `사건 ${payload.id}. 실제 영향은 조사 중입니다.`;
+    }
+  }
+  // Blue's assessment text is the autonomous agent's reasoning, which the
+  // monitor is instructed to produce in English, so the feed surfaces it
+  // inline instead of only pointing at /alerts.
+  const analysis = inlineAnalysis(payload.analysis);
   if (notification.kind === "coverage_gap") {
     if (payload.reason === "collector_restarted") {
-      return "[Blue Cell] 수집기가 재시작됐습니다. 저장된 수집 카운터와 최근 대상 이벤트를 확인해 관측 연속성을 검토하세요.";
+      return "[Blue Cell] Collector restarted. Review the persisted collection counters and recent target events for observation continuity.";
     }
     if (payload.reason === "receiver_state_replaced") {
-      return "[Blue Cell] 수신기 저장소가 교체되거나 초기화됐습니다. 이전 관측 기록의 연속성을 확인하세요.";
+      return "[Blue Cell] Receiver store was replaced or reset. Verify the continuity of prior observations.";
     }
     if (payload.reason === "collector_data_loss") {
       const counters = Object.entries(payload.counters ?? {})
         .map(([name, count]) => `${name}=${count}`).join(", ");
-      return `[Blue Cell] 수집 공백: 수집 파이프라인에서 기록 누락이 확인됐습니다. ${counters || "자세한 내용은 /blue metrics를 확인하세요."} 이 구간의 공격 부재를 판단할 수 없습니다.`;
+      return `[Blue Cell] Coverage gap: the collection pipeline dropped records. ${counters || "See /blue metrics for details."} The absence of attacks in this window cannot be established.`;
     }
-    return "[Blue Cell] 수집 공백: 대상 로그 수집기 또는 수신기가 응답하지 않습니다. /blue status로 상태를 확인하세요.";
+    return "[Blue Cell] Coverage gap: the target log collector or receiver is not responding. Check /blue status.";
   }
   if (notification.kind === "coverage_restored") {
-    return "[Blue Cell] 수집기 응답이 복구됐습니다. 이전 관측 공백은 사라진 것으로 간주할 수 없습니다.";
+    return "[Blue Cell] Collector responded again. Previous coverage gaps cannot be assumed absent.";
   }
   if (notification.kind === "watch_alert") {
     const sequences = payload.evidence?.event_seqs?.join(", ") ?? "?";
-    return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} 상주 감시 알림. ` +
-      `${(payload.analysis ?? "조사 결과가 없습니다.").slice(0, 4000)} ` +
-      `근거 이벤트 ${sequences}, 사건 ${payload.id}.`;
+    return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} standing-watch alert. ` +
+      `Evidence events ${sequences}, incident ${payload.id}.` +
+      (analysis ? `\n  Assessment: ${analysis}` : "");
   }
   if (notification.kind === "watch_error") {
-    return `[Blue Cell] 이벤트 ${payload.start_seq ?? "?"}–${payload.end_seq ?? "?"} 구간의 ` +
-      `AI 감시에 실패했습니다. ${payload.error ?? "감시 상태를 확인하세요."}`;
+    return `[Blue Cell] events ${payload.start_seq ?? "?"}–${payload.end_seq ?? "?"} –` +
+      `AI watch failed. ${payload.error ?? "Check the watch state."}`;
   }
   if (notification.kind === "assessment") {
-    return `[Blue Cell 조사] 사건 ${payload.id}\n${(payload.analysis ?? "조사 결과가 없습니다.").slice(0, 4000)}`;
+    return analysis
+      ? `[Blue Cell investigation] incident ${payload.id}: ${analysis}`
+      : `[Blue Cell investigation] incident ${payload.id}: assessment ready. /alerts for details.`;
   }
   if (notification.kind === "analysis_error") {
-    return `[Blue Cell] 사건 ${payload.id} 자동 조사를 완료하지 못했습니다. /blue analyze로 다시 조사할 수 있습니다.`;
+    return `[Blue Cell] incident ${payload.id} automatic investigation did not complete. Retry with /blue analyze.`;
   }
   const evidence = payload.evidence ?? {};
   if (evidence.message_excerpt) {
-    return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} ${payload.rule_id ?? "detection"} 탐지. ` +
-      `대상 로그: ${evidence.message_excerpt.slice(0, 500)} 사건 ${payload.id}. 실제 영향은 조사 중입니다.`;
+    return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} ${payload.rule_id ?? "detection"} detection. ` +
+      `Target log: ${evidence.message_excerpt.slice(0, 100)} incident ${payload.id}. Real impact under investigation.`;
   }
   const request = [evidence.method, evidence.uri].filter(Boolean).join(" ");
-  return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} ${payload.rule_id ?? "detection"} 탐지. ` +
-    `요청 ${request || "알 수 없음"}, HTTP ${evidence.status ?? "?"}, ` +
-    `사건 ${payload.id}. 실제 영향은 조사 중입니다.`;
+  return `[Blue Cell] ${(payload.severity ?? "unknown").toUpperCase()} ${payload.rule_id ?? "detection"} detection. ` +
+    `Request ${request || "unknown"}, HTTP ${evidence.status ?? "?"}, ` +
+    `incident ${payload.id}. Real impact under investigation.`;
 }
 
-export function useBlueNotifications(addSystemEvent: (message: string) => void): void {
+// Raw rule detections stay out of the conversation feed: the standing-watch
+// and investigation agents produce the conclusions worth reading inline, while
+// every detection still accumulates in state for /alerts and the unread badge.
+const INLINE_FEED_KINDS: ReadonlySet<BlueNotification["kind"]> = new Set([
+  "assessment",
+  "watch_alert",
+  "coverage_gap",
+  "coverage_restored",
+  "watch_error",
+  "analysis_error",
+]);
+
+export function useBlueNotifications(
+  addSystemEvent: (message: string) => void,
+  // Gate for surfacing Blue Cell events into the conversation feed. Blue events
+  // belong to Blue mode only and must never invade the Red (or Plan)
+  // conversation, so the caller passes `() => mode === "blue"`. Events still
+  // accumulate in state regardless, so they stay viewable in Blue mode (via
+  // /alerts and the unread badge). Defaults to always-surface for tests.
+  surface: () => boolean = () => true,
+) {
+  const callback = useRef(addSystemEvent);
+  callback.current = addSystemEvent;
+  const surfaceRef = useRef(surface);
+  surfaceRef.current = surface;
+  const emit = useCallback((message: string) => {
+    if (surfaceRef.current()) callback.current(message);
+  }, []);
+  const url = (process.env.BLUE_MONITOR_URL ?? "http://127.0.0.1:18085").replace(/\/$/, "");
+  const [state, setState] = useState<BlueState>({ status: "unavailable", notifications: [], unreadCount: 0, lastSequence: 0, collectorStatus: "unknown", aiStatus: "unknown", error: null });
+  const cursor = useRef({ after: 0, acknowledged: 0 });
+  const persist = useCallback(() => {
+    try { writeBlueCursor(url, cursor.current); }
+    catch (error) { setState(previous => ({ ...previous, error: `Blue cursor save failed: ${error instanceof Error ? error.message : String(error)}` })); }
+  }, [url]);
+  const acknowledge = useCallback(() => {
+    cursor.current.acknowledged = cursor.current.after;
+    setState(previous => ({ ...previous, unreadCount: 0 }));
+    persist();
+  }, [persist]);
   useEffect(() => {
-    const url = (process.env.BLUE_MONITOR_URL ?? "http://127.0.0.1:18085").replace(/\/$/, "");
-    let after = 0;
+    try { cursor.current = readBlueCursor(url); }
+    catch (error) { setState(previous => ({ ...previous, error: `Blue cursor load failed: ${error instanceof Error ? error.message : String(error)}` })); }
+    setState(previous => ({ ...previous, lastSequence: cursor.current.after }));
     let stopped = false;
     let polling = false;
-
+    let connected = false;
+    let disconnected = false;
+    let failureStreak = 0;
+    let nextPollAt = 0;
+    const revisions = new Set<string>();
     async function poll(): Promise<void> {
-      if (stopped || polling) return;
+      if (stopped || polling || Date.now() < nextPollAt) return;
       polling = true;
       try {
         for (let pageNumber = 0; pageNumber < 10 && !stopped; pageNumber++) {
-          const response = await fetch(`${url}/notifications?after=${after}&limit=100`, {
-            signal: AbortSignal.timeout(3000),
-          });
-          if (!response.ok) return;
-          const page = (await response.json()) as NotificationPage;
-          if (!Array.isArray(page.notifications) || stopped) return;
-          for (const notification of page.notifications) {
-            addSystemEvent(formatBlueNotification(notification));
-            after = notification.seq;
+          // Existing monitor fetch policy: bounded timeout and retry on the next poll.
+          const response = await fetch(`${url}/notifications?after=${cursor.current.after}&limit=100`, { signal: AbortSignal.timeout(3000) });
+          if (!response.ok) throw new DOMException(`Blue monitor HTTP ${response.status}`, "NetworkError");
+          const page = pageSchema.parse(await response.json());
+          if (stopped) return;
+          connected = true;
+          disconnected = false;
+          failureStreak = 0;
+          nextPollAt = 0;
+          if ((page.latest_seq ?? page.next_after) !== undefined && (page.latest_seq ?? page.next_after ?? cursor.current.after) < cursor.current.after) {
+            cursor.current = { after: 0, acknowledged: 0 };
+            revisions.clear();
+            setState(previous => ({ ...previous, notifications: [], unreadCount: 0, collectorStatus: "gap", lastSequence: 0 }));
+            emit("[Blue Cell] Receiver sequence reset; observation continuity needs review.");
+            persist();
+            continue;
           }
+          setState(previous => ({ ...previous, status: "connected", error: null }));
+          for (const notification of page.notifications) {
+            if (notification.seq <= cursor.current.after) continue;
+            cursor.current.after = notification.seq;
+            const revision = JSON.stringify([notification.payload.id, notification.kind, notification.payload.revision ?? notification.payload]);
+            if (revisions.has(revision)) continue;
+            revisions.add(revision);
+            if (INLINE_FEED_KINDS.has(notification.kind)) emit(formatBlueNotification(notification));
+            setState(previous => ({ ...previous,
+              notifications: [...previous.notifications, notification].slice(-500),
+              lastSequence: notification.seq,
+              unreadCount: previous.unreadCount + Number(notification.seq > cursor.current.acknowledged),
+              collectorStatus: notification.kind === "coverage_gap" ? "gap" : notification.kind === "coverage_restored" ? "healthy" : previous.collectorStatus,
+              aiStatus: notification.kind === "watch_error" || notification.kind === "analysis_error" ? "error" : notification.kind === "assessment" || notification.kind === "watch_alert" ? "healthy" : previous.aiStatus,
+            }));
+          }
+          setState(previous => ({ ...previous, lastSequence: cursor.current.after }));
+          persist();
           if (!page.has_more) break;
         }
-      } catch {
-        return;
-      } finally {
-        polling = false;
-      }
+      } catch (error) {
+        if (stopped) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setState(previous => ({ ...previous, status: connected ? "disconnected" : "unavailable", error: message, collectorStatus: "unknown", aiStatus: "unknown" }));
+        if (connected && !disconnected) emit(`[Blue Cell] Monitor disconnected: ${message}`);
+        disconnected = true;
+        // The Blue stack is optional. Bound retries when it is unavailable;
+        // keep the existing overlap guard and restore 1 s polling on success.
+        failureStreak = Math.min(failureStreak + 1, 7);
+        if (failureStreak >= 2) {
+          nextPollAt = Date.now() + Math.min(1000 * 2 ** (failureStreak - 2), 30000);
+        }
+      } finally { polling = false; }
     }
-
     void poll();
     const timer = setInterval(() => { void poll(); }, 1000);
     return () => { stopped = true; clearInterval(timer); };
-  }, [addSystemEvent]);
+  }, [url, persist]);
+  return { ...state, acknowledge, getDetails: (id: string) => state.notifications.filter(notification => notification.payload.id === id) };
+}
+
+export function formatBlueNotificationDetails(notification: BlueNotification): string {
+  const { analysis, ...evidence } = notification.payload;
+  return [formatBlueNotification(notification), analysis, JSON.stringify(evidence, null, 2)].filter(Boolean).join("\n\n");
 }

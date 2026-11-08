@@ -13,7 +13,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import type { OpplanState } from "../hooks/useOpplan.js";
-import { STATUS_ICON, GLYPH_DOT, GLYPH_HOOK, GLYPH_ELLIPSIS } from "../utils/theme.js";
+import { PALETTE, STATUS_ICON, GLYPH_DOT, GLYPH_HOOK, GLYPH_ELLIPSIS } from "../utils/theme.js";
 
 const MAX_VISIBLE = 8;
 
@@ -33,7 +33,7 @@ export const OpplanStatus = React.memo(function OpplanStatus({
   const pendingCount = objectives.length - completedCount - inProgressCount - blockedCount;
 
   const allDone = completedCount === objectives.length;
-  const dotColor = allDone ? "green" : "cyan";
+  const dotColor = allDone ? PALETTE.success : PALETTE.info;
 
   // Build summary parts
   const parts: string[] = [];
@@ -49,10 +49,10 @@ export const OpplanStatus = React.memo(function OpplanStatus({
   return (
     <Box flexDirection="column" marginTop={1}>
       {/* Header: ● N objectives (summary) */}
-      <Text>
+      <Text color={PALETTE.text}>
         <Text color={dotColor}>{`${GLYPH_DOT} `}</Text>
-        <Text>{objectives.length} objective{objectives.length !== 1 ? "s" : ""}</Text>
-        <Text dimColor>{" ("}{parts.join(", ")}{")"}</Text>
+        <Text color={PALETTE.text}>{objectives.length} objective{objectives.length !== 1 ? "s" : ""}</Text>
+        <Text color={PALETTE.text} dimColor>{" ("}{parts.join(", ")}{")"}</Text>
       </Text>
 
       {/* Objective list with ⎿ connector on first line */}
@@ -62,10 +62,10 @@ export const OpplanStatus = React.memo(function OpplanStatus({
         const isActive = obj.status === "in-progress";
         const prefix = i === 0 ? `  ${GLYPH_HOOK}  ` : "     ";
         return (
-          <Text key={obj.id} wrap="wrap">
-            <Text dimColor>{prefix}</Text>
+          <Text color={PALETTE.text} key={obj.id} wrap="wrap">
+            <Text color={PALETTE.text} dimColor>{prefix}</Text>
             <Text color={color}>{icon}</Text>
-            <Text
+            <Text color={PALETTE.text}
               bold={isActive}
               strikethrough={isDone}
               dimColor={isDone || obj.status === "blocked"}
@@ -78,7 +78,7 @@ export const OpplanStatus = React.memo(function OpplanStatus({
 
       {/* Hidden count */}
       {hiddenCount > 0 && (
-        <Text dimColor>{`     ${GLYPH_ELLIPSIS} +\u200A`}{hiddenCount}{" more"}</Text>
+        <Text color={PALETTE.text} dimColor>{`     ${GLYPH_ELLIPSIS} +\u200A`}{hiddenCount}{" more"}</Text>
       )}
     </Box>
   );

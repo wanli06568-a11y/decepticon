@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { STATUS_ICON, GLYPH_HOOK } from "../utils/theme.js";
+import { PALETTE, STATUS_ICON, GLYPH_HOOK } from "../utils/theme.js";
 
 export interface ObjectiveItem {
   id: string;
@@ -85,10 +85,10 @@ export const ObjectiveList = React.memo(function ObjectiveList({
         // First line gets ⎿ connector (Claude Code style), rest get aligned indent
         const prefix = i === 0 ? `  ${GLYPH_HOOK}  ` : "     ";
         return (
-          <Text key={obj.id} wrap="wrap">
+          <Text color={PALETTE.text} key={obj.id} wrap="wrap">
             {prefix}
             <Text color={color}>{icon}</Text>
-            <Text color={isDone ? "gray" : "white"}>{` ${obj.title}`}</Text>
+            <Text color={isDone ? PALETTE.muted : PALETTE.text}>{` ${obj.title}`}</Text>
           </Text>
         );
       })}

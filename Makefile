@@ -58,10 +58,10 @@ export CODEX_AUTH_VOLUME ?= $(shell test -f $(HOME)/.codex/auth.json && echo $(H
         dev cli-dev web-dev infra \
         quality quality-strict quality-cli test test-local lint lint-fix \
         ci-lint ci-test ci-test-coverage ci-test-coverage-report \
-        web-build web-hotswap web-lint web-migrate \
-        status logs health clean \
+        web-build web-hotswap web-lint web-test web-migrate \
+        status logs health clean clean-dev-images \
         node-install web-db-ensure \
-		benchmark terminal-bench recreate-litellm
+        benchmark terminal-bench terminal-bench-full recreate-litellm
 
 # ── Help (default target) ────────────────────────────────────────
 
@@ -101,10 +101,12 @@ help:
 	@echo "  make logs [SVC=]  Follow logs (default: langgraph)"
 	@echo "  make health       KG + Neo4j; Web when running"
 	@echo "  make clean        Full teardown (compose volumes + .dogfood/)"
+	@echo "  make clean-dev-images  Remove :dev images + dangling layers (release-verify leftovers)"
 	@echo ""
 	@echo "Other:"
 	@echo "  make benchmark [ARGS=\"--level 1\"]"
 	@echo "  make terminal-bench [ARGS=\"--include-task-name <task>\"]  # GPT-5.6 Luna/max"
+	@echo "  make terminal-bench-full  # resumable 89-task / 445-trial run"
 
 # ── Pre-release Verification (PRIMARY) ───────────────────────────
 
@@ -133,7 +135,7 @@ dogfood: launcher
 ## Build the Go launcher binary (version=dev, gates auto-update + config sync).
 launcher:
 	cd clients/launcher && go build \
-		-ldflags '-X github.com/PurpleAILAB/Decepticon/clients/launcher/cmd.version=dev' \
+		-ldflags '-X github.com/BitterSecurity/Decepticon/clients/launcher/cmd.version=dev' \
 		-o bin/decepticon
 
 ## Compose-only smoke (no launcher, no onboard wizard) — fastest possible
@@ -283,22 +285,38 @@ ci-test-coverage-report:
 	uv run --extra mcp pytest -n auto --cov --cov-report=xml --cov-report=term --cov-fail-under=0 -m "not slow"
 
 quality-cli: node-install
+	npm audit --audit-level=high
 	# streaming workspace must be built first — its package.json main
 	# resolves to dist/, which cli's typecheck + build consume.
 	npm run build --workspace=@decepticon/streaming
 	npm run typecheck --workspace=@decepticon/cli
 	npm run build --workspace=@decepticon/cli
-	npm run test --workspace=@decepticon/cli
+	npm run test --workspace=@decepticon/cli -- $(CLI_TEST_ARGS)
+
+# The optional Worker has a separate lockfile; the root workspace audit cannot see it.
+.PHONY: telemetry-install telemetry-check telemetry-build quality-telemetry
+telemetry-install:
+	npm ci --prefix telemetry-gateway --no-audit --no-fund
+
+telemetry-check: telemetry-install
+	npm audit --prefix telemetry-gateway --audit-level=high
+	npm run typecheck --prefix telemetry-gateway
+	npm run test --prefix telemetry-gateway -- --maxWorkers=2
+
+telemetry-build: telemetry-install
+	cd telemetry-gateway && WRANGLER_SEND_METRICS=false npm exec -- wrangler deploy --dry-run --outdir .wrangler/deploy
+
+quality-telemetry: telemetry-check telemetry-build
 
 ## PR gate — mirrors CI PR lane (errors-only typecheck + fast pytest + CLI + Web).
 ## Use before opening a PR; passing this guarantees CI will pass.
-quality: ci-lint ci-test quality-cli web-lint web-build
+quality: ci-lint ci-test quality-cli quality-telemetry web-lint web-test web-build
 	@echo ""
 	@echo "OK — PR gates passed (mirrors CI PR lane)"
 
 ## Release gate — mirrors CI main-push lane (coverage 60%) + full basedpyright
 ## audit (warnings + info). Run before tagging a release.
-quality-strict: ci-lint ci-test-coverage quality-cli web-lint web-build
+quality-strict: ci-lint ci-test-coverage quality-cli quality-telemetry web-lint web-test web-build
 	@echo ""
 	@echo "==> basedpyright (full — warning + info audit, non-blocking)"
 	uv run basedpyright
@@ -322,6 +340,9 @@ web-hotswap: node-install web-build
 
 web-lint: node-install
 	cd $(WEB_DIR) && npx eslint src/ --max-warnings 0
+
+web-test: node-install
+	npm run test --workspace=web
 
 web-migrate: node-install
 	cd $(WEB_DIR) && npx prisma migrate dev --name $(or $(NAME),init)
@@ -357,6 +378,20 @@ clean:
 	$(COMPOSE) $(PROFILES_ALL) down --volumes --remove-orphans
 	@rm -rf $(DOGFOOD_HOME)
 	@echo "OK — compose volumes purged, .dogfood/ removed"
+
+## Remove :dev-tagged images + dangling layers left behind by dogfood /
+## release-verify runs. Locally built :dev images share almost no layers
+## with the GHCR release images, so every release-verify cycle otherwise
+## parks a full second copy (~10 GB for the sandbox alone) on disk. Safe
+## to run while a stack is up: docker rmi skips images still in use.
+.PHONY: clean-dev-images
+clean-dev-images:
+	@echo "[clean-dev-images] Removing :dev-tagged decepticon images..."
+	@docker images --format '{{.Repository}}:{{.Tag}}' \
+		| grep -E '^ghcr\.io/bittersecurity/decepticon-[a-z-]+:dev$$' \
+		| xargs -r -n1 docker rmi 2>/dev/null || true
+	@docker image prune -f
+	@echo "[clean-dev-images] OK — run 'make dogfood' or 'make smoke' to rebuild :dev"
 
 # ── Internal idempotent helpers ──────────────────────────────────
 
@@ -400,12 +435,29 @@ TERMINAL_BENCH_EFFORT ?= max
 terminal-bench:
 	DECEPTICON_SKIP_BOOT=1 PYTHONPATH="$(CURDIR)$${PYTHONPATH:+:$${PYTHONPATH}}" \
 	uv run harbor run --dataset terminal-bench/terminal-bench-2-1 \
-		--agent decepticon_tbench_agent:DecepticonTerminalBenchAgent \
+		--agent benchmark.terminal_bench:DecepticonTerminalBenchAgent \
 		--model "$(TERMINAL_BENCH_MODEL)" \
-		--agent-kwarg "reasoning_effort=$(TERMINAL_BENCH_EFFORT)" $(ARGS)
+		--agent-kwarg "reasoning_effort=$(TERMINAL_BENCH_EFFORT)" \
+		--jobs-dir benchmark/results/terminal-bench $(ARGS)
+
+terminal-bench-full:
+	TERMINAL_BENCH_MODEL="$(TERMINAL_BENCH_MODEL)" \
+	TERMINAL_BENCH_EFFORT="$(TERMINAL_BENCH_EFFORT)" \
+	benchmark/terminal_bench/run_full.sh $(ARGS)
 
 ## CVE-Bench offline dry run (mocked LLM + sandbox, 3 fixtures, seed=0).
 ## Output: benchmark/results/cve-bench/dry-run-<YYYY-MM-DD>.jsonl
 cve-bench-dry:
 	CVE_BENCH_DRY_RUN_SEED=0 PYTHONHASHSEED=0 \
 		uv run python -m benchmark.cve_bench.dry_run $(ARGS)
+
+# Local integration uses owned fixtures; live suites require explicit resources.
+.PHONY: test-unit test-integration test-live
+test-unit:
+	uv run pytest packages/decepticon-core/tests packages/decepticon/tests/unit packages/decepticon-sdk/tests -m "not slow" $(ARGS)
+
+test-integration:
+	uv run pytest packages/decepticon/tests/integration $(ARGS)
+
+test-live:
+	uv run pytest --live packages/decepticon/tests/live $(ARGS)

@@ -46,12 +46,16 @@ dependencies = [
     "langchain-core>=0.3.0",
     "langchain-openai>=0.3.0",
     "langchain-anthropic>=0.3.0",
-    "langgraph>=1.0.0",
-    "langgraph-cli[inmem]>=0.2.0",
+    "langgraph>=1.2.17,<2",
+    "langgraph-cli[inmem]>=0.4.37",
+    # Keep fresh installs above the Store authorization security floor.
+    "langgraph-api>=0.15.0,<1",
+    # Certificate parser floor: includes constructed/indefinite decoder fixes.
+    "pyasn1>=0.6.5",
     "langgraph-sdk>=0.1.0",
     # HTTP
     "httpx>=0.27.0",
-    "deepagents>=0.5.0",
+    "deepagents>=0.7.32,<0.8",
     # Open-web engine (decepticon/sandbox_web) — runs inside the sandbox, which
     # mounts decepticon as /deps/decepticon, so its pure-Python parse deps ride
     # the main install set (same rationale as the FastAPI/uvicorn note below).
@@ -80,9 +84,10 @@ dependencies = [
     #   starlette    — CVE-2026-48818 / -48817 / -54283 / -54282 (fixed ≤1.3.1)
     #   langchain    — GHSA-gr75-jv2w-4656 (fixed 1.3.9)
     "click>=8.3.3",
+    "certifi>=2026.10.19",
     "cryptography>=50.0.0",
     "starlette>=1.3.1",
-    "langchain>=1.3.9",
+    "langchain>=1.4.7,<2",
 ]
 
 [project.optional-dependencies]
@@ -102,8 +107,19 @@ telemetry = [
 # client) can drive engagements. Provides the ``decepticon-mcp`` script.
 # pyjwt[crypto] backs the JWT (OAuth 2.1 resource-server) auth mode on the
 # streamable-http transport; shared-secret + stdio modes never import it.
-mcp = ["mcp>=1.9.0", "pyjwt[crypto]>=2.10"]
-all = ["decepticon[neo4j,telemetry,mcp]"]
+mcp = ["mcp>=1.30.0,<2", "pyjwt[crypto]>=2.10"]
+# Blue observation (the AutoBot package — the defensive sibling). Installing
+# this extra serves the autobot graph on the Decepticon server via the
+# ``decepticon.agents`` entry-point (migration stage 2c, design doc §0.3/§0.5).
+blue = ["bs-autobot>=0.1.1"]
+# OpenShell kernel-boundary transport: the local admission resolver converts
+# the compiled RoE policy into the SDK's SandboxSpec proto and manages the
+# sandbox lifecycle. Without it the openshell provider stays unavailable.
+# Keep the SDK at or below the target gateway's minor version: a newer SDK
+# against an older gateway is unqualified skew (0.1.6 SDK → 0.1.5 gateway
+# shares protocol v1, but is not a tested pairing).
+openshell = ["openshell>=0.1.6,<0.2"]
+all = ["decepticon[neo4j,telemetry,mcp,blue,openshell]"]
 
 [project.scripts]
 decepticon-cli = "decepticon.cli.__main__:main"
@@ -171,7 +187,6 @@ postexploit = "decepticon.agents.standard.postexploit:SUBAGENT_SPEC"
 phisher = "decepticon.agents.standard.phisher:SUBAGENT_SPEC"
 mobile_operator = "decepticon.agents.standard.mobile_operator:SUBAGENT_SPEC"
 wireless_operator = "decepticon.agents.standard.wireless_operator:SUBAGENT_SPEC"
-blue_cell = "decepticon.agents.standard.blue_cell:SUBAGENT_SPEC"
 osint_operator = "decepticon.agents.standard.osint_operator:SUBAGENT_SPEC"
 iot_operator = "decepticon.agents.standard.iot_operator:SUBAGENT_SPEC"
 ics_operator = "decepticon.agents.standard.ics_operator:SUBAGENT_SPEC"
@@ -188,8 +203,8 @@ exploiter = "decepticon.agents.plugins.exploiter:SUBAGENT_SPEC"
 mitre_lookup = "decepticon.tools.mitre:get_mitre_tools"
 
 [project.urls]
-Homepage = "https://github.com/PurpleAILAB/Decepticon"
-Repository = "https://github.com/PurpleAILAB/Decepticon"
+Homepage = "https://github.com/BitterSecurity/Decepticon"
+Repository = "https://github.com/BitterSecurity/Decepticon"
 
 [build-system]
 requires = ["hatchling"]

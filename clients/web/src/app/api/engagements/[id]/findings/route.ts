@@ -4,6 +4,7 @@ import { resolveEngagementDir } from "@/lib/workspace";
 import { NextRequest, NextResponse } from "next/server";
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as yaml from "js-yaml";
 
 interface Finding {
   id: string;
@@ -18,12 +19,58 @@ interface Finding {
   cwe?: string[];
   mitre?: string[];
   remediation?: string;
+  resultKind?: string;
+  verificationStatus?: string;
+  verificationRationale?: string;
+  reportStatus?: string;
+}
+
+// Flat-scalar frontmatter, matching the finding-protocol template's
+// `key: value` lines. Nested YAML (e.g. evidence_manifest) isn't needed by
+// this projection, so any list/map value is dropped rather than parsed.
+// A real YAML parser (not a hand-rolled line regex) is required even for
+// scalars: free-text fields like `verification_rationale` legitimately use
+// block literal/folded scalars (`|`, `>`) and quoted escapes, both of which
+// a `^key:\s*(.*)$` regex silently mishandles — it captures an empty value
+// for a block scalar's header line (dropping the field) and leaves quote/
+// backslash escapes in double- or single-quoted values un-decoded.
+function parseFrontmatter(content: string): { metadata: Record<string, string>; body: string } {
+  const lines = content.split("\n");
+  if (lines[0]?.trim() !== "---") {
+    return { metadata: {}, body: content };
+  }
+  const end = lines.findIndex((line, i) => i > 0 && /^---[ \t\r]*$/.test(line));
+  if (end === -1) {
+    return { metadata: {}, body: content };
+  }
+  const metadata: Record<string, string> = {};
+  try {
+    const parsed: unknown = yaml.load(lines.slice(1, end).join("\n"));
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        // Type validation: only flat scalars are projected here. A list/map/
+        // date value means the document needs real structured parsing
+        // (evidence_manifest etc.), which is check_finding_report's job, not
+        // this read-only projection's.
+        if (typeof value === "string") {
+          if (value) metadata[key] = value;
+        } else if (typeof value === "number" || typeof value === "boolean") {
+          metadata[key] = String(value);
+        }
+      }
+    }
+  } catch {
+    // Malformed YAML: fall back to no metadata rather than failing the
+    // whole findings listing over one bad file.
+  }
+  return { metadata, body: lines.slice(end + 1).join("\n") };
 }
 
 function parseFindingMarkdown(content: string, filename: string): Finding {
-  const lines = content.split("\n");
-  let title = filename;
-  let severity = "medium";
+  const { metadata, body } = parseFrontmatter(content);
+  const lines = body.split("\n");
+  let title = metadata.title ?? filename;
+  let severity = metadata.severity;
   let description = "";
   let evidence = "";
   let attackVector = "";
@@ -40,7 +87,7 @@ function parseFindingMarkdown(content: string, filename: string): Finding {
     const trimmed = line.trim();
 
     if (trimmed.startsWith("# ")) {
-      title = trimmed.slice(2).trim();
+      if (!metadata.title) title = trimmed.slice(2).trim();
       continue;
     }
 
@@ -49,11 +96,13 @@ function parseFindingMarkdown(content: string, filename: string): Finding {
       continue;
     }
 
-    const severityMatch = trimmed.toLowerCase();
-    if (severityMatch.includes("severity") && trimmed.includes(":")) {
-      const val = trimmed.split(":")[1]?.trim().replace(/\*/g, "").toLowerCase();
-      if (["critical", "high", "medium", "low", "informational"].includes(val)) {
-        severity = val;
+    if (!metadata.severity) {
+      const severityMatch = trimmed.toLowerCase();
+      if (severityMatch.includes("severity") && trimmed.includes(":")) {
+        const val = trimmed.split(":")[1]?.trim().replace(/\*/g, "").toLowerCase();
+        if (["critical", "high", "medium", "low", "informational"].includes(val)) {
+          severity = val;
+        }
       }
     }
     if (trimmed.toLowerCase().startsWith("cvss score") && trimmed.includes(":")) {
@@ -64,7 +113,7 @@ function parseFindingMarkdown(content: string, filename: string): Finding {
       cvssVector = trimmed.split(":").slice(1).join(":").trim() || undefined;
     }
 
-    if (currentSection === "description" && trimmed) {
+    if ((currentSection === "summary" || currentSection === "description") && trimmed) {
       description += (description ? "\n" : "") + trimmed;
     }
     if (currentSection === "evidence" && trimmed) {
@@ -103,7 +152,7 @@ function parseFindingMarkdown(content: string, filename: string): Finding {
   return {
     id: filename.replace(".md", ""),
     title,
-    severity,
+    severity: severity || "unspecified",
     description: description || "No description available.",
     evidence: evidence || "No evidence recorded.",
     attackVector: attackVector || "Unknown",
@@ -113,6 +162,10 @@ function parseFindingMarkdown(content: string, filename: string): Finding {
     ...(cwe.length > 0 && { cwe }),
     ...(mitre.length > 0 && { mitre }),
     ...(remediation && { remediation }),
+    ...(metadata.result_kind && { resultKind: metadata.result_kind }),
+    ...(metadata.verification_status && { verificationStatus: metadata.verification_status }),
+    ...(metadata.verification_rationale && { verificationRationale: metadata.verification_rationale }),
+    ...(metadata.report_status && { reportStatus: metadata.report_status }),
   };
 }
 

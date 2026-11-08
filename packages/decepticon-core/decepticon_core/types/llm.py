@@ -37,8 +37,8 @@ Tier × AuthMethod matrix
   anthropic_api    claude-opus-4-8               claude-sonnet-4-6              claude-haiku-4-5
   anthropic_oauth  auth/claude-opus-4-8          auth/claude-sonnet-4-6         auth/claude-haiku-4-5
   openai_api       gpt-5.5                       gpt-5.4                        gpt-5-nano
-  openai_oauth     auth/gpt-5.5                  auth/gpt-5.4                   auth/gpt-5.4-mini
-  google_api       gemini-2.5-pro                gemini-2.5-flash               gemini-2.5-flash-lite
+  openai_oauth     auth/gpt-6-astra               auth/gpt-6.1-sol               auth/gpt-6-luna
+  google_api       gemini-3.8-flash              gemini-3.8-flash               gemini-3.5-flash-lite
   minimax_api      MiniMax-M3                    MiniMax-M2.7-highspeed         — (falls through)
   openrouter_api   claude-opus-4-8               claude-sonnet-4-6              claude-haiku-4-5
   nvidia_api       llama-3.3-70b-instruct        nemotron-70b-instruct          llama-3.2-3b-instruct
@@ -65,6 +65,8 @@ collide in the model_list.
   zenmux_api       zenmux/anthropic/…opus-4.6    zenmux/anthropic/…sonnet-4.6  zenmux/anthropic/…haiku-4.5
   qianfan_api      qianfan/ernie-4.5-turbo-128k  qianfan/ernie-4.5-turbo-32k   qianfan/ernie-speed-pro-128k
   cloudflare_gw    cfgateway/anthropic/…opus     cfgateway/anthropic/…sonnet   cfgateway/anthropic/…haiku
+  cheaper_inf      cheaperinference/…sonnet-5    cheaperinference/gpt-5.4      cheaperinference/gpt-5.4-mini
+  openai_compat_gw compat/<OPENAI_COMPAT_GATEWAY_MODEL_*>   (env-driven; DEFAULT OFF)
 
 Code-heavy override
 -------------------
@@ -72,10 +74,9 @@ For roles that benefit from OpenAI's agentic coding specialization (patcher,
 exploiter, contract_auditor, reverser, verifier), set
 ``DECEPTICON_MODEL_<ROLE>`` to one of the registered Codex variant routes:
   - ``openai/gpt-5.3-codex``       (paid API key)
-  - ``auth/gpt-5.3-codex``         (ChatGPT subscription via Codex backend)
+  - ``auth/gpt-6.1-sol``           (ChatGPT subscription via Codex backend)
   - ``copilot/gpt-5.3-codex``      (GitHub Copilot subscription)
-These are NOT default tier picks — gpt-5.5 stays HIGH for general agent
-balance — but are registered so per-role overrides work without yaml edits.
+These routes are registered so per-role overrides work without yaml edits.
 
 Profiles
 --------
@@ -165,6 +166,10 @@ class AuthMethod(StrEnum):
     ZENMUX_API = "zenmux_api"  # ZenMux multi-vendor gateway
     QIANFAN_API = "qianfan_api"  # Baidu Qianfan (ERNIE) v2 OpenAI-compatible
     CLOUDFLARE_GATEWAY_API = "cloudflare_gateway_api"  # Cloudflare AI Gateway
+    CHEAPER_INFERENCE_API = "cheaper_inference_api"  # Cheaper Inference (cheaperinference.com)
+    # Generic opt-in OpenAI-compatible gateway (env-driven base URL + key + model).
+    # DEFAULT OFF — no vendor endpoint is hardcoded. See #989.
+    OPENAI_COMPAT_GATEWAY_API = "openai_compat_gateway_api"
 
 
 # ── Tier × AuthMethod → model_id matrix ─────────────────────────────────
@@ -189,21 +194,22 @@ METHOD_MODELS: dict[AuthMethod, dict[Tier, str]] = {
         Tier.LOW: "openai/gpt-5-nano",
     },
     AuthMethod.GOOGLE_API: {
-        Tier.HIGH: "gemini/gemini-2.5-pro",
-        Tier.MID: "gemini/gemini-2.5-flash",
-        Tier.LOW: "gemini/gemini-2.5-flash-lite",
+        # Public 2.5 API access is limited to previously active users. Current
+        # GA defaults also work for new API projects; explicit legacy choices
+        # and the separate Gemini subscription route definitions are preserved.
+        Tier.HIGH: "gemini/gemini-3.8-flash",
+        Tier.MID: "gemini/gemini-3.8-flash",
+        Tier.LOW: "gemini/gemini-3.5-flash-lite",
     },
     AuthMethod.MINIMAX_API: {
         Tier.HIGH: "minimax/MiniMax-M3",
         Tier.MID: "minimax/MiniMax-M2.7-highspeed",
     },
     AuthMethod.OPENAI_OAUTH: {
-        Tier.HIGH: "auth/gpt-5.5",
-        Tier.MID: "auth/gpt-5.4",
-        # ChatGPT subscription doesn't include gpt-5-nano; the Codex CLI
-        # exposes ``gpt-5.4-mini`` as its small-tier slot (codex-rs
-        # models-manager/models.json, May 2026), so route LOW there.
-        Tier.LOW: "auth/gpt-5.4-mini",
+        # Current Codex subscription models: https://learn.chatgpt.com/docs/models
+        Tier.HIGH: "auth/gpt-6-astra",
+        Tier.MID: "auth/gpt-6.1-sol",
+        Tier.LOW: "auth/gpt-6-luna",
     },
     AuthMethod.GOOGLE_OAUTH: {
         Tier.HIGH: "gemini-sub/gemini-2.5-pro",
@@ -318,13 +324,14 @@ METHOD_MODELS: dict[AuthMethod, dict[Tier, str]] = {
         Tier.MID: "azure/gpt-5.4",
         Tier.LOW: "azure/gpt-5-nano",
     },
-    # Groq — LPU inference, fast Llama. groq/<model>.
-    # llama-3.1-70b-versatile was retired in 2026; using Llama 4 Scout
-    # (Groq production model) at MID since Llama 3.3 70B sits at HIGH.
+    # Groq — LPU inference with tool-capable GPT-OSS defaults. groq/<model>.
+    # Scout retired for free/developer tiers on 2026-07-17; Llama 3.1/3.3
+    # followed on 2026-08-16. Current GPT-OSS models support agent tools.
+    # Explicit saved/role model IDs remain untouched for enterprise users.
     AuthMethod.GROQ_API: {
-        Tier.HIGH: "groq/llama-3.3-70b-versatile",
-        Tier.MID: "groq/meta-llama/llama-4-scout-17b-16e-instruct",
-        Tier.LOW: "groq/llama-3.1-8b-instant",
+        Tier.HIGH: "groq/openai/gpt-oss-120b",
+        Tier.MID: "groq/openai/gpt-oss-120b",
+        Tier.LOW: "groq/openai/gpt-oss-20b",
     },
     # Together AI — together_ai/<model>.
     AuthMethod.TOGETHER_API: {
@@ -476,7 +483,10 @@ METHOD_MODELS: dict[AuthMethod, dict[Tier, str]] = {
         # exposing ``creator/model`` slugs across most major vendors.
         Tier.HIGH: "nanogpt/anthropic/claude-opus-4.6",
         Tier.MID: "nanogpt/anthropic/claude-sonnet-4.6",
-        Tier.LOW: "nanogpt/anthropic/claude-3-5-haiku-20241022",
+        # Was pinned to the legacy claude-3-5-haiku-20241022 id, which has no
+        # matching litellm.yaml route (that file registers the current-gen
+        # claude-haiku-4.5, matching every sibling gateway's LOW tier below).
+        Tier.LOW: "nanogpt/anthropic/claude-haiku-4.5",
     },
     AuthMethod.SYNTHETIC_API: {
         # Synthetic — https://api.synthetic.new/openai/v1. Open-weight
@@ -511,6 +521,15 @@ METHOD_MODELS: dict[AuthMethod, dict[Tier, str]] = {
         Tier.HIGH: "cfgateway/anthropic/claude-opus-4-6",
         Tier.MID: "cfgateway/anthropic/claude-sonnet-4-6",
         Tier.LOW: "cfgateway/anthropic/claude-haiku-4-5",
+    },
+    AuthMethod.CHEAPER_INFERENCE_API: {
+        # Cheaper Inference — https://api.cheaperinference.com/v1. One key
+        # gives access to models from several labs; route a mixed tier set
+        # verified against GET /v1/models. claude-sonnet-5 rejects sampling,
+        # already handled by _model_drops_temperature on the slug.
+        Tier.HIGH: "cheaperinference/claude-sonnet-5",
+        Tier.MID: "cheaperinference/gpt-5.4",
+        Tier.LOW: "cheaperinference/gpt-5.4-mini",
     },
 }
 
@@ -763,6 +782,33 @@ def _resolve_custom_openai_model() -> str | None:
     return f"custom/{model}"
 
 
+def _clean_compat_gateway_model(value: str) -> str | None:
+    model = value.strip()
+    slug = model.split("/", 1)[1] if model.lower().startswith("compat/") else model
+    if slug.lower() in {"", "none", "null", "-"} or any(c.isspace() for c in slug):
+        return None
+    return model if model.lower().startswith("compat/") else f"compat/{model}"
+
+
+def _resolve_openai_compat_gateway_model(tier: Tier) -> str | None:
+    """Return ``compat/<model>`` for ``tier`` when the generic gateway is wired.
+
+    Reads ``OPENAI_COMPAT_GATEWAY_MODEL_{HIGH,MID,LOW}`` first, then falls
+    back to ``OPENAI_COMPAT_GATEWAY_MODEL`` for every tier. Returns None when
+    neither the shared nor the tier-specific model env is set — the method
+    is then skipped in ``resolve_chain`` (DEFAULT OFF alongside the factory
+    credential check that also requires base URL + key).
+    """
+    tier_env = {
+        Tier.HIGH: "OPENAI_COMPAT_GATEWAY_MODEL_HIGH",
+        Tier.MID: "OPENAI_COMPAT_GATEWAY_MODEL_MID",
+        Tier.LOW: "OPENAI_COMPAT_GATEWAY_MODEL_LOW",
+    }[tier]
+    return _clean_compat_gateway_model(os.getenv(tier_env, "")) or _clean_compat_gateway_model(
+        os.getenv("OPENAI_COMPAT_GATEWAY_MODEL", "")
+    )
+
+
 def resolve_chain(tier: Tier, credentials: Credentials) -> list[str]:
     """Build the model chain (primary first, then fallbacks) for a tier.
 
@@ -804,6 +850,11 @@ def resolve_chain(tier: Tier, credentials: Credentials) -> list[str]:
             custom_model = _resolve_custom_openai_model()
             if custom_model is not None:
                 chain.append(custom_model)
+            continue
+        if method == AuthMethod.OPENAI_COMPAT_GATEWAY_API:
+            compat_model = _resolve_openai_compat_gateway_model(tier)
+            if compat_model is not None:
+                chain.append(compat_model)
             continue
         model = METHOD_MODELS[method].get(tier)
         if model is not None:

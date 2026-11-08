@@ -14,34 +14,40 @@ import {
   Loader2, CheckCircle2, XCircle, Clock, AlertTriangle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { RenderStructuredDocument } from "@/components/plan/structured-document";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 // ── Document metadata ──────────────────────────────────────────────
 
 const DOC_META = [
-  { key: "opplan", label: "OPPLAN", desc: "Operations Plan", icon: Target, color: "text-amber-400" },
-  { key: "conops", label: "CONOPS", desc: "Concept of Operations", icon: FileText, color: "text-cyan-400" },
-  { key: "roe", label: "ROE", desc: "Rules of Engagement", icon: Shield, color: "text-emerald-400" },
-  { key: "deconfliction", label: "Deconfliction", desc: "Deconfliction Plan", icon: Radio, color: "text-purple-400" },
+  { key: "opplan", label: "OPPLAN", desc: "Operations Plan", icon: Target, color: "text-amber-800 dark:text-amber-400" },
+  { key: "roe", label: "ROE", desc: "Rules of Engagement", icon: Shield, color: "text-emerald-800 dark:text-emerald-400" },
+  { key: "threat-profile", label: "Threat Profile", desc: "Adversary Persona and TTPs", icon: Target, color: "text-red-800 dark:text-red-400" },
+  { key: "conops", label: "CONOPS", desc: "Concept of Operations", icon: FileText, color: "text-cyan-800 dark:text-cyan-400" },
+  { key: "deconfliction", label: "Deconfliction", desc: "Deconfliction Plan", icon: Radio, color: "text-purple-800 dark:text-purple-400" },
+  { key: "contact", label: "Contacts", desc: "Contact and Escalation Plan", icon: FileText, color: "text-blue-800 dark:text-blue-400" },
+  { key: "data-handling", label: "Data Handling", desc: "Evidence Retention and Custody", icon: Shield, color: "text-teal-800 dark:text-teal-400" },
+  { key: "abort", label: "Abort Plan", desc: "Emergency Halt Conditions", icon: AlertTriangle, color: "text-orange-800 dark:text-orange-400" },
+  { key: "cleanup", label: "Cleanup Plan", desc: "Artifact Removal Plan", icon: CheckCircle2, color: "text-lime-800 dark:text-lime-400" },
 ] as const;
 
 // ── Status helpers ─────────────────────────────────────────────────
 
 const statusIcon: Record<string, { icon: typeof CheckCircle2; color: string }> = {
-  completed: { icon: CheckCircle2, color: "text-green-400" },
-  blocked: { icon: XCircle, color: "text-red-400" },
-  "in-progress": { icon: Loader2, color: "text-amber-400" },
+  completed: { icon: CheckCircle2, color: "text-green-800 dark:text-green-400" },
+  blocked: { icon: XCircle, color: "text-red-800 dark:text-red-400" },
+  "in-progress": { icon: Loader2, color: "text-amber-800 dark:text-amber-400" },
   pending: { icon: Clock, color: "text-muted-foreground" },
   cancelled: { icon: XCircle, color: "text-muted-foreground/50" },
 };
 
 const severityColor: Record<string, string> = {
-  loud: "text-red-400",
-  standard: "text-amber-400",
-  careful: "text-yellow-400",
-  quiet: "text-blue-400",
-  silent: "text-emerald-400",
+  loud: "text-red-800 dark:text-red-400",
+  standard: "text-amber-800 dark:text-amber-400",
+  careful: "text-yellow-800 dark:text-yellow-400",
+  quiet: "text-blue-800 dark:text-blue-400",
+  silent: "text-emerald-800 dark:text-emerald-400",
 };
 
 // ── Section component ──────────────────────────────────────────────
@@ -118,8 +124,8 @@ function RenderOpplan({ data }: { data: any }) {
             />
           </div>
           <div className="flex gap-4 text-xs text-muted-foreground">
-            <span className="text-green-400">{completed} passed</span>
-            <span className="text-red-400">{blocked} blocked</span>
+            <span className="text-green-800 dark:text-green-400">{completed} passed</span>
+            <span className="text-red-800 dark:text-red-400">{blocked} blocked</span>
             <span>{total - completed - blocked} remaining</span>
           </div>
         </div>
@@ -321,7 +327,7 @@ function RenderConops({ data }: { data: any }) {
             <ul className="space-y-1.5">
               {criteria.map((c, i) => (
                 <li key={i} className="flex items-start gap-2 text-sm">
-                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-800 dark:text-emerald-400" />
                   <span>{c}</span>
                 </li>
               ))}
@@ -435,7 +441,7 @@ function RenderRoe({ data }: { data: any }) {
             <ul className="space-y-1.5">
               {prohibited.map((p, i) => (
                 <li key={i} className="flex items-start gap-2 text-sm">
-                  <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+                  <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-800 dark:text-red-400" />
                   <span>{p}</span>
                 </li>
               ))}
@@ -451,7 +457,7 @@ function RenderRoe({ data }: { data: any }) {
             <ul className="space-y-1.5">
               {permitted.map((p, i) => (
                 <li key={i} className="flex items-start gap-2 text-sm">
-                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-800 dark:text-emerald-400" />
                   <span>{p}</span>
                 </li>
               ))}
@@ -574,6 +580,11 @@ const renderers: Record<string, React.FC<{ data: any }>> = {
   conops: RenderConops,
   roe: RenderRoe,
   deconfliction: RenderDeconfliction,
+  "threat-profile": RenderStructuredDocument,
+  contact: RenderStructuredDocument,
+  "data-handling": RenderStructuredDocument,
+  abort: RenderStructuredDocument,
+  cleanup: RenderStructuredDocument,
 };
 
 // ── Page ───────────────────────────────────────────────────────────

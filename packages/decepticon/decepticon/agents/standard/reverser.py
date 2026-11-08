@@ -52,6 +52,7 @@ from decepticon.agents.build import build_middleware, build_tools
 from decepticon.agents.prompts import load_prompt
 from decepticon.backends import build_sandbox_backend, make_agent_backend
 from decepticon.llm import LLMFactory
+from decepticon.middleware.step_budget import StepBudgetMiddleware, effective_recursion_limit
 from decepticon.tools.bash import BASH_TOOLS
 from decepticon.tools.bash.bash import set_sandbox
 from decepticon.tools.reversing.rea import REA_TOOLS, rea_configured
@@ -70,6 +71,16 @@ _STANDARD_TOOLS: dict[str, Any] = {
         *BASH_TOOLS,
     ]
 }
+_LEGACY_GHIDRA_TOOLS = frozenset(
+    {
+        "bin_ghidra_script",
+        "ghidra_analyze",
+        "ghidra_decompile",
+        "ghidra_xrefs",
+        "ghidra_status",
+        "re_status",
+    }
+)
 
 
 _ROLE = "reverser"
@@ -135,6 +146,8 @@ def create_reverser_agent(
     if tools is None:
         standard_tools = dict(_STANDARD_TOOLS)
         if rea_configured():
+            for name in _LEGACY_GHIDRA_TOOLS:
+                standard_tools.pop(name, None)
             standard_tools.update({tool.name: tool for tool in REA_TOOLS})
         tools = build_tools(role=_ROLE, standard_tools=standard_tools)
     if middleware is None:
@@ -152,11 +165,14 @@ def create_reverser_agent(
         llm,
         system_prompt=system_prompt,
         tools=tools,
-        middleware=middleware,
+        middleware=[
+            *middleware,
+            StepBudgetMiddleware(total_steps=recursion_limit or _RECURSION_LIMIT),
+        ],
         name=_ROLE,
     ).with_config(
         {
-            "recursion_limit": recursion_limit or _RECURSION_LIMIT,
+            "recursion_limit": effective_recursion_limit(recursion_limit or _RECURSION_LIMIT),
             "callbacks": load_plugin_callbacks(role=_ROLE, backend=backend),
         }
     )

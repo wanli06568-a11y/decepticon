@@ -51,6 +51,7 @@ from its own factory.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from deepagents.middleware.subagents import CompiledSubAgent
@@ -62,6 +63,7 @@ from decepticon.agents.prompts import load_prompt
 from decepticon.backends import build_sandbox_backend, make_agent_backend
 from decepticon.core.subagent_streaming import StreamingRunnable
 from decepticon.llm import LLMFactory
+from decepticon.middleware.step_budget import StepBudgetMiddleware, effective_recursion_limit
 from decepticon_core.plugin_loader import (
     is_bundle_enabled,
     load_plugin_callbacks,
@@ -69,13 +71,16 @@ from decepticon_core.plugin_loader import (
 )
 
 _ROLE = "vulnresearch"
-_RECURSION_LIMIT = 1000
+_RECURSION_LIMIT = 2000  # issue #1145: raised from the per-role values (120-1000) — flash models loop in report phases; the env-tunable main budget is 2000 too
 
 # kg_query / kg_stats were removed pending the Neo4j middleware redesign
 # (see docs/design/neo4j-research-notes.md). KG surface is currently
 # limited to the analyst agent. This orchestrator now relies purely on
 # subagent dispatch and has no direct tools.
 _STANDARD_TOOLS: dict[str, Any] = {}
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_vulnresearch_agent(
@@ -145,14 +150,26 @@ def create_vulnresearch_agent(
     # this roster without modifying OSS — see
     # ``decepticon/plugin_loader.py`` for the loader contract.
     if subagents is None:
-        subagents = [
-            CompiledSubAgent(
-                name=spec.name,
-                description=spec.description,
-                runnable=StreamingRunnable(spec.factory(), spec.name),
-            )
-            for spec in load_subagents_for_parent(_ROLE)
-        ]
+        # Optional subagent packages (e.g. the AutoBot defender) degrade
+        # gracefully: a subagent whose factory raises (missing model env,
+        # absent optional dep) is skipped with a warning — never the parent
+        # agent. The purple loop activates when the package is configured.
+        subagents = []
+        for spec in load_subagents_for_parent(_ROLE):
+            try:
+                subagents.append(
+                    CompiledSubAgent(
+                        name=spec.name,
+                        description=spec.description,
+                        runnable=StreamingRunnable(spec.factory(), spec.name),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - optional capability
+                logger.warning(
+                    "subagent %r skipped (optional capability unavailable): %s",
+                    spec.name,
+                    exc,
+                )
 
     if tools is None:
         tools = build_tools(role=_ROLE, standard_tools=_STANDARD_TOOLS)
@@ -178,11 +195,14 @@ def create_vulnresearch_agent(
         llm,
         system_prompt=system_prompt,
         tools=tools,
-        middleware=middleware,
+        middleware=[
+            *middleware,
+            StepBudgetMiddleware(total_steps=recursion_limit or _RECURSION_LIMIT),
+        ],
         name=_ROLE,
     ).with_config(
         {
-            "recursion_limit": recursion_limit or _RECURSION_LIMIT,
+            "recursion_limit": effective_recursion_limit(recursion_limit or _RECURSION_LIMIT),
             "callbacks": load_plugin_callbacks(role=_ROLE, backend=backend),
         }
     )

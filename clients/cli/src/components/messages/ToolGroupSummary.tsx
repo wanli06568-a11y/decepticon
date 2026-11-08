@@ -10,7 +10,7 @@ import { Box, Text } from "ink";
 import type { ToolGroup } from "../../utils/groupEvents.js";
 import { formatToolGroup } from "../../utils/groupEvents.js";
 import { CtrlOToExpand } from "../shell/CtrlOToExpand.js";
-import { GLYPH_DOT } from "../../utils/theme.js";
+import { PALETTE, GLYPH_DOT } from "../../utils/theme.js";
 
 interface Props {
   group: ToolGroup;
@@ -22,9 +22,9 @@ export const ToolGroupSummary = React.memo(function ToolGroupSummary({
   const summary = formatToolGroup(group);
   return (
     <Box flexDirection="column" marginTop={1}>
-      <Text>
-        <Text color="green">{`${GLYPH_DOT} `}</Text>
-        <Text dimColor>{summary}</Text>
+      <Text color={PALETTE.text}>
+        <Text color={PALETTE.success}>{`${GLYPH_DOT} `}</Text>
+        <Text color={PALETTE.text} dimColor>{summary}</Text>
         <CtrlOToExpand />
       </Text>
     </Box>

@@ -15,6 +15,7 @@ from decepticon.agents.prompts import load_prompt
 from decepticon.agents.standard.soundwave import _STANDARD_TOOLS
 from decepticon.backends import build_sandbox_backend, make_agent_backend
 from decepticon.llm import LLMFactory
+from decepticon.middleware.step_budget import StepBudgetMiddleware, effective_recursion_limit
 from decepticon_core.plugin_loader import is_bundle_enabled, load_plugin_callbacks
 
 _ROLE = "soundwave"
@@ -62,11 +63,14 @@ def create_autohunt_agent(
         llm,
         system_prompt=system_prompt,
         tools=tools,
-        middleware=middleware,
+        middleware=[
+            *middleware,
+            StepBudgetMiddleware(total_steps=recursion_limit or _RECURSION_LIMIT),
+        ],
         name=_GRAPH_NAME,
     ).with_config(
         {
-            "recursion_limit": recursion_limit or _RECURSION_LIMIT,
+            "recursion_limit": effective_recursion_limit(recursion_limit or _RECURSION_LIMIT),
             "callbacks": load_plugin_callbacks(role=_ROLE, backend=backend),
         }
     )

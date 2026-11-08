@@ -28,6 +28,7 @@ re-inspect a session it already saw), not the primary delivery path.
 """
 
 import logging
+import os
 import re
 import threading
 from collections import OrderedDict
@@ -119,6 +120,7 @@ class SandboxNotificationMiddleware(AgentMiddleware):
     def __init__(self, sandbox: BashSandboxProtocol) -> None:
         super().__init__()
         self._sandbox = sandbox
+        self._runtime_targets: OrderedDict[str, SandboxNotificationMiddleware] = OrderedDict()
         # OrderedDict-as-set so we can both check membership and evict in
         # insertion order. Values are unused; we keep ``True`` to make the
         # intent explicit at call sites.
@@ -130,10 +132,36 @@ class SandboxNotificationMiddleware(AgentMiddleware):
         self._pull_attempts: dict[str, int] = {}
         self._lock = threading.Lock()
 
+    def _runtime_target(self, runtime):
+        # Static graphs are constructed before a binding exists. Resolve only
+        # native runs here; never swap the shared middleware's sandbox field.
+        from decepticon.backends.factory import _run_config, build_sandbox_backend
+
+        config = _run_config(getattr(runtime, "config", None))
+        configurable = config.get("configurable", {})
+        requested = configurable.get("sandbox_provider") if isinstance(configurable, dict) else None
+        if (
+            os.environ.get("DECEPTICON_SANDBOX_PROVIDER", "").strip() != "openshell"
+            and requested != "openshell"
+        ):
+            return self
+        sandbox = build_sandbox_backend(config or None)
+        if sandbox is self._sandbox:
+            return self
+        with self._lock:
+            target = self._runtime_targets.get(sandbox.id)
+            if target is None or target._sandbox is not sandbox:
+                target = SandboxNotificationMiddleware(sandbox)
+                self._runtime_targets[sandbox.id] = target
+            self._runtime_targets.move_to_end(sandbox.id)
+            while len(self._runtime_targets) > 128:
+                self._runtime_targets.popitem(last=False)
+            return target
+
     def _jobs_view(self):
         """Defensive accessor for the sandbox's job registry.
 
-        ``HTTPSandbox`` exposes ``_jobs`` as an internal attribute (mirrored
+        ``HTTPTransportSandbox`` exposes ``_jobs`` as an internal attribute (mirrored
         from the daemon-side tracker). Going through ``getattr`` lets us
         survive a backend that has not yet attached the registry (e.g. a
         partially constructed sandbox in a test fixture) without crashing
@@ -318,9 +346,11 @@ class SandboxNotificationMiddleware(AgentMiddleware):
                 log.warning("poll_completion failed for session=%s: %s", job.session, e)
 
     def before_model(self, state, runtime):  # type: ignore[override]
-        self._refresh_running_jobs()
-        return self._build_message()
+        target = self._runtime_target(runtime)
+        target._refresh_running_jobs()
+        return target._build_message()
 
     async def abefore_model(self, state, runtime):  # type: ignore[override]
-        await self._arefresh_running_jobs()
-        return self._build_message()
+        target = self._runtime_target(runtime)
+        await target._arefresh_running_jobs()
+        return target._build_message()

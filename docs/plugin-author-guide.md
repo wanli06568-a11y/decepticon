@@ -1,5 +1,8 @@
 # Plugin Author Guide
 
+For agents, skills, business workflows and client adapters, start with the
+[current extension contract](design/extension-contract.md).
+
 Audience: someone shipping a `pip install`-able Decepticon plugin —
 custom tools, middleware, agents, callbacks, skills, or prompt
 fragments.
@@ -132,7 +135,7 @@ files as package data:
 "skills/my-plugin/" = "skills/my-plugin/"
 ```
 
-### Prompt fragment (new in this release)
+### Prompt fragment
 
 ```python
 from decepticon_sdk import PromptContribution
@@ -162,8 +165,8 @@ from decepticon_sdk import PluginBundle
 
 def get_bundle() -> PluginBundle:
     return PluginBundle(
-        name="my-plugin-v1",
-        activation_label="my-plugin",
+        bundle="my-plugin",
+        roles=("recon",),
         # ...
     )
 ```
@@ -176,7 +179,7 @@ my-plugin-v1 = "my_plugin:get_bundle"
 Operators enable your bundle:
 
 ```bash
-DECEPTICON_PLUGINS=standard,my-plugin python -m decepticon ...
+DECEPTICON_PLUGINS=standard,my-plugin python your_agent_app.py
 ```
 
 ### Safety-critical overrides
@@ -259,7 +262,7 @@ user installs the wheel. No registration call needed.
 ## See also
 
 - The redesign spec at
-  [`docs/superpowers/specs/2026-05-23-core-framework-sdk-split-design.md`](superpowers/specs/2026-05-23-core-framework-sdk-split-design.md)
+  [current extension contract](design/extension-contract.md)
   — full design rationale.
 - Example plugins per kind at
   [`packages/decepticon-sdk/examples/`](../packages/decepticon-sdk/examples/).

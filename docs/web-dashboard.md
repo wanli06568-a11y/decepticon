@@ -22,32 +22,9 @@ The dashboard is **dynamic-spawn** (v1.1.8+): it does NOT come up on `decepticon
 | `/web url` | prints `http://localhost:${WEB_PORT}` without touching docker |
 | `/dashboard` | alias for `/web` |
 
-**Desktop app (contributors):**
-```bash
-npm run desktop
-```
-
-The desktop app is an Electron shell for the product UI:
-
-| Mode | When | Target |
-|---|---|---|
-| `auto` (default) | Local install present → local; otherwise cloud | `http://localhost:${WEB_PORT:-3000}` or `https://app.decepticon.red` |
-| `cloud` | `DECEPTICON_DESKTOP_MODE=cloud` | Hosted app (website login, Google/GitHub OAuth in-window) |
-| `local` | `DECEPTICON_DESKTOP_MODE=local` | Local dashboard; auto-starts the `web` Docker Compose profile from `~/.decepticon` when offline |
-
-Sessions use a persistent Electron partition (`persist:decepticon-desktop`). Optional one-shot cookie import: drop a Cookie-Editor JSON or Netscape export at `~/.decepticon/desktop-cookies.txt` (Windows: `%USERPROFILE%\.decepticon\desktop-cookies.txt`) or set `DECEPTICON_DESKTOP_COOKIES`. Prefer interactive sign-in; never commit session tokens.
-
-Cross-platform notes (Linux / macOS / Windows):
-
-| Concern | Behavior |
-|---|---|
-| Install copy-button | `install.sh` on Unix; `install.ps1` + winget Docker hint on Windows |
-| Local stack start | `docker compose …` via argv spawn (`shell: false`); `windowsHide` on Windows |
-| Login form edit keys | Application **Edit** menu roles (required for Cmd/Ctrl+C/V on all three) |
-| Window lifecycle | macOS stays running after last window close (dock re-activate); others quit |
-| CI | `Desktop (ubuntu/macOS/windows)` runs unit + syntax checks on every desktop change |
-
-External links stay in the system browser; status UI matches the product branding when bootstrap is blocked.
+Open the dashboard URL in a browser. The deprecated Electron wrapper is not a
+separate supported dashboard workflow; its retirement is tracked in
+[#1133](https://github.com/BitterSecurity/Decepticon/pull/1133).
 
 Headless operators (no CLI, e.g. CI) can drive the same lifecycle from the host shell:
 ```bash
@@ -72,19 +49,23 @@ Runs the Next.js dev server locally on the host while infra (postgres, neo4j, li
 
 ### Engagement Setup
 
-Create a new engagement by providing a target. Five input types:
+Create an engagement with one target and authorization reference. Choose Red
+for direct execution, Plan for optional Soundwave planning, or Blue for local
+sensor investigation. The current direct-scope form accepts:
 
 | Type | Example |
 |------|---------|
 | IP range | `10.0.0.0/24` |
 | Web URL | `https://app.example.com` |
-| Git repository | `https://github.com/org/repo` |
-| File upload | Binary, archive, or source tree |
-| Local path | `/path/to/target` |
 
 ### Soundwave Interview
 
-After creating an engagement, Soundwave interviews you to define the threat actor profile, scope, exclusions, and testing window. The interview streams in real time in the browser. When complete, Soundwave generates the full engagement document package (RoE, ConOps, Deconfliction Plan, OPPLAN).
+Plan mode runs Soundwave's optional planning workflow. It prepares seven
+documents alongside the operator-provisioned, read-only RoE; publication leaves
+the user in Plan. Red can start directly from approved scope without this bundle.
+To move from Plan to Red, review the current scope and select Red. There is no
+separate Red approval marker or required Plan-bundle approval. Blue mode checks the local sensor before opening its
+defensive agent. Each mode keeps its own terminal session and LangGraph thread.
 
 ### Execution Streaming
 

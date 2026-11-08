@@ -229,7 +229,7 @@ launcher and every service image come from the current checkout (tag
 real `~/.decepticon` is untouched.
 
 ```bash
-git clone https://github.com/PurpleAILAB/Decepticon.git
+git clone https://github.com/BitterSecurity/Decepticon.git
 cd Decepticon
 make dogfood
 ```
@@ -325,10 +325,22 @@ default fallback chain; pick a specific route at runtime with `/model`
 | ZenMux | `ZENMUX_API_KEY` | [zenmux.ai](https://zenmux.ai) |
 | Baidu Qianfan (ERNIE) | `QIANFAN_API_KEY` | [console.bce.baidu.com/qianfan](https://console.bce.baidu.com/qianfan) |
 | Cloudflare AI Gateway | `CLOUDFLARE_AI_GATEWAY_API_KEY` + `CLOUDFLARE_AI_GATEWAY_API_BASE` | [dash.cloudflare.com](https://dash.cloudflare.com) |
+| Cheaper Inference | `CHEAPER_INFERENCE_API_KEY` | [cheaperinference.com](https://cheaperinference.com) |
+| Generic OpenAI-compatible gateway (opt-in) | `OPENAI_COMPAT_GATEWAY_API_KEY` + `OPENAI_COMPAT_GATEWAY_API_BASE` + `OPENAI_COMPAT_GATEWAY_MODEL` | any OpenAI-compatible `/v1` endpoint |
 
 > Cloudflare's base URL is per-account — set it to your gateway's
 > OpenAI-compat `…/compat` path. Qianfan model ids drift; override per
 > role with `DECEPTICON_MODEL_<ROLE>` if a default 404s.
+>
+> The generic OpenAI-compatible gateway is **DEFAULT OFF**: all three of
+> base URL, key, and model must be set. No vendor endpoint is hardcoded
+> (`compat/<model>` routes through whatever base URL you supply).
+> The base URL must be an absolute HTTP(S) URL. Keys follow the existing
+> credential policy: at least 24 characters and no placeholder tokens. Model
+> slugs must be nonempty and contain no whitespace. A shared model covers all
+> tiers; `OPENAI_COMPAT_GATEWAY_MODEL_HIGH`, `_MID`, and `_LOW` override individual
+> tiers. If only tier overrides are provided, unconfigured tiers need another
+> configured provider. Empty values and `none`, `null`, or `-` use the shared model.
 
 ---
 
@@ -636,17 +648,17 @@ Complete list of all supported LLM providers and their pre-configured models:
 |----------|--------|-----------|------|
 | **Subscriptions (OAuth — no API billing)** | | | |
 | Claude Max/Pro/Team | Opus, Sonnet, Haiku | OAuth | $20–$100/mo |
-| ChatGPT Pro/Plus/Team | `auth/gpt-5.5`, `auth/gpt-5.4`, `auth/gpt-5.4-mini` (+ `auth/gpt-5.3-codex` for code agents) | OAuth | $20–$200/mo |
+| ChatGPT Pro/Plus/Team | `auth/gpt-5.6-sol`, `auth/gpt-5.6-terra`, `auth/gpt-5.6-luna`, plus GPT-5.5/5.4 routes | OAuth | $20–$200/mo |
 | Gemini Advanced | Gemini 2.5 Pro/Flash | OAuth | $20/mo |
 | Copilot Pro | `copilot/gpt-5.5`, `copilot/claude-sonnet-4-6`, `copilot/gpt-5.4-mini` (+ `copilot/gpt-5.3-codex`) | OAuth | $20/mo |
 | SuperGrok | Grok 4.3, Grok 4-1 Fast Reasoning | OAuth | X Premium+ |
 | Perplexity Pro | Sonar Pro, Sonar | OAuth | $20/mo |
 | **API Key Providers (pay-per-token)** | | | |
-| Anthropic | Claude Opus 4.7, Sonnet 4.6, Haiku 4.5 | API key | Per token |
-| OpenAI | GPT-5.5, GPT-5.4, GPT-5-nano (+ GPT-5.3-Codex for code agents) | API key | Per token |
-| DeepSeek | DeepSeek Chat, DeepSeek Reasoner | API key | Per token |
-| Google | Gemini 2.5 Flash, Gemini 2.5 Pro | API key | Per token |
-| xAI | Grok 4.3, Grok 4-1 Fast Reasoning | API key | Per token |
+| Anthropic | Claude Opus 5.5, Sonnet 5.5, Haiku 4.5, earlier routes | API key | Per token |
+| OpenAI | GPT-6 Astra/6.1 Sol/6 Luna, GPT-5.6 family, earlier routes | API key | Per token |
+| DeepSeek | DeepSeek V4 Pro/Flash, Chat, Reasoner | API key | Per token |
+| Google | Gemini 3.8 Flash, Gemini 3.7/3.6 Flash, Gemini 2.5 family | API key | Per token |
+| xAI | Grok 4.7/4.5/4.3, Grok 4-1 Fast Reasoning | API key | Per token |
 | Mistral | Mistral Large, Codestral | API key | Per token |
 | Cohere | Command R+, Command R | API key | Per token |
 | Groq | Llama 3.3 70B, Llama 3.1 8B | API key | Per token |
@@ -663,6 +675,15 @@ Complete list of all supported LLM providers and their pre-configured models:
 | Custom Gateway | Any OpenAI-compatible server | API key + base URL | Varies |
 
 **Adding models not in the static config:**
+
+Current production LiteLLM routes missing from the base config are included in
+`config/litellm_prod_catalog.json`. At startup, OSS registers a catalog
+route when its provider API key is configured in `~/.decepticon/.env`;
+`runyour/*` also needs `RUNYOUR_API_BASE`. The `/model` command lists
+the current model IDs. A listed route still requires its provider credential
+and provider-side access. The catalog omits SaaS tenant and admin aliases.
+The existing tier defaults stay in place; select a current route with
+`/model <model-id>` or `DECEPTICON_MODEL_<ROLE>`.
 
 Set `DECEPTICON_MODEL` or `DECEPTICON_LITELLM_MODELS` and Decepticon auto-generates the LiteLLM route at container startup:
 
@@ -768,7 +789,7 @@ Complete walkthrough from zero to a running autonomous engagement, covering ever
 curl -fsSL https://decepticon.red/install | bash
 
 # Or from source
-git clone https://github.com/PurpleAILAB/Decepticon.git
+git clone https://github.com/BitterSecurity/Decepticon.git
 cd Decepticon
 make install
 ```
@@ -834,50 +855,37 @@ Once running, you have:
 
 ```bash
 # Decepticon shows the engagement picker after launch
-# Select "New engagement" → type a slug → Soundwave starts interviewing you
+# Select "New engagement", enter its name, targets and exclusions
+# Review normalized scope and any selected discovery additions
+# Creation writes machine scope and opens Red; no separate approval command
+# Existing workspaces with missing scope can use /scope import <file> --confirm
+# Inside the session, use /mode plan, /mode red, or /mode blue
 ```
 
 **Option B — Web Dashboard:**
 
 1. Open `http://localhost:3000`
 2. Click "New Engagement"
-3. Enter: name, target type (IP range, URL, Git repo, file, local path), target value
-4. Click "Create" → opens the live terminal with Soundwave
+3. Enter a name, one root URL or IP/CIDR target, and an authorization reference
+4. Confirm authorization, choose Red, Plan, or Blue, and click "Create"
 
-### Step 6: The Soundwave Interview
+### Step 6: Optional Soundwave Plan
 
-Soundwave conducts a structured interview to generate the engagement package:
+Enter `/mode plan` explicitly for Soundwave discussion or planning documents.
+Soundwave reads the operator-provisioned RoE and can prepare seven additional
+JSON documents: Threat Profile, CONOPS, Deconfliction, Contact, Data Handling,
+Abort and Cleanup. It cannot modify the protected RoE or write OPPLAN.
 
-```
-Questions you'll answer:
-├── Target scope (IPs, URLs, domains)
-├── Threat actor profile (nation-state, criminal, insider)
-├── Authorized actions (scanning, exploitation, lateral movement)
-├── Exclusions (production DBs, critical infra)
-├── Testing window (hours, days, timezone)
-├── OPSEC requirements (noise level, detection avoidance)
-└── Acceptance criteria (what does "done" look like)
-```
-
-Soundwave generates an eight-document engagement bundle from your answers:
-
-| Document | Purpose |
-|----------|---------|
-| **RoE** | Legal authorization, scope, exclusions, escalation contacts |
-| **Threat Profile** | MITRE-mapped adversary persona and key TTPs |
-| **CONOPS** | Threat model and kill-chain phases, scoped to the RoE |
-| **Deconfliction Plan** | Source IPs, time windows, SOC coordination codes |
-| **Contact Plan** | Operator and escalation roster, plus the abort-signal recipient |
-| **Data Handling Plan** | Evidence retention, encryption, and chain-of-custody |
-| **Abort Plan** | Halt triggers and AI-aware safety gates |
-| **Cleanup Plan** | Expected artifacts and per-phase removal commands |
-
-The orchestrator builds the **OPPLAN** (objectives, phases, MITRE ATT&CK
-mapping) from the bundle — Soundwave does not write it.
+Publication validates the eight-document bundle and leaves the user in Plan;
+it does not grant Red approval or switch modes. Direct approved Red execution
+requires none of these seven optional documents. See the
+[engagement workflow](engagement-workflow.md) and
+[operator RoE provisioning](roe-provisioning.md).
 
 ### Step 7: Autonomous Execution
 
-After you approve the OPPLAN, Decepticon takes over:
+After operator approval of the current RoE and explicit Red selection,
+Decepticon can build the OPPLAN and begin execution:
 
 ```
 Decepticon (Orchestrator)

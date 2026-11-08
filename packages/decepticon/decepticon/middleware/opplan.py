@@ -5,7 +5,7 @@ model prompt, registers OPPLAN tools from ``decepticon.tools.opplan``, and
 enforces one OPPLAN tool call per model step.
 
 OPPLAN persistence uses the same configured backend as the engagement
-filesystem tools. In production that backend is HTTPSandbox, scoped through
+filesystem tools. In production that backend is HTTPTransportSandbox, scoped through
 EngagementFilesystemBackend, so reads/writes target the sandbox's active
 engagement workspace rather than the LangGraph host filesystem.
 
@@ -66,6 +66,24 @@ _PLAN_MUTATION_TOOLS = frozenset(
 
 def _reduce_engagement_name(current: str | None, update: str | None) -> str | None:
     """Merge concurrent launcher/tool writes to the stable engagement slug."""
+    import logging as _log
+
+    if update == "roe-tui-verify":
+        try:
+            from langgraph.config import get_config as _gc
+
+            cfg = _gc()
+            node = (cfg or {}).get("metadata", {}).get("langgraph_node")
+            ccfg = (cfg or {}).get("configurable", {})
+            _log.getLogger(__name__).warning(
+                "REDUCE-NODE node=%r thread=%r cfg.eng=%r cfg.thread=%r",
+                node,
+                ccfg.get("thread_id"),
+                ccfg.get("engagement_name"),
+                ccfg.get("thread_id"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.getLogger(__name__).warning("REDUCE-NODE cfg unreadable: %s", exc)
     return update if update is not None else current
 
 
@@ -183,6 +201,13 @@ before issuing the next. This applies to read tools (`get_objective`,
 `list_objectives`) as well as mutating tools.
 
 ### Workflow
+Scope approval is permission, not a request to begin work. For a greeting,
+interface question, or an explicit request not to execute, answer conversationally
+without bootstrapping a mission, OPPLAN, or blocked artifact. Bootstrap only when
+the operator requests engagement work or asks to continue an existing objective.
+If authorization is absent, ask one blocking question and wait for an operator
+response; do not repeatedly ask or create an authorization-only mission/DAG.
+
 ```
 load_opplan → inspect applicable scope, authorization, and planning context
           → commit_opplan(complete DAG, expected_revision=0)

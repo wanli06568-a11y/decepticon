@@ -20,6 +20,7 @@ dependencies = [
 # is invisible at root because uv treats extras as per-project.
 neo4j = ["decepticon[neo4j]"]
 mcp = ["decepticon[mcp]"]
+openshell = ["decepticon[openshell]"]
 
 [tool.uv]
 # Virtual root — no wheel built from the workspace umbrella. Real
@@ -143,6 +144,8 @@ testpaths = [
 ]
 markers = [
     "asyncio: mark test as async (pytest-asyncio)",
+    "live: explicitly enabled tests against externally provisioned services",
+    "integration: tests using owned local processes or HTTP fixtures",
     "slow: integration-style tests that hit wall-clock timeouts or otherwise take seconds; deselected from the PR fast lane",
 ]
 addopts = [
@@ -152,7 +155,11 @@ addopts = [
 ]
 
 [tool.coverage.run]
-source = ["packages/decepticon/decepticon"]
+source = [
+    "packages/decepticon/decepticon",
+    "packages/decepticon-core/decepticon_core",
+    "packages/decepticon-sdk/decepticon_sdk",
+]
 branch = true
 omit = [
     "packages/decepticon/decepticon/__main__.py",

@@ -52,6 +52,11 @@ jobs:
               packages/decepticon-core/pyproject.toml \
               packages/decepticon/pyproject.toml \
               packages/decepticon-sdk/pyproject.toml
+          sed -i 's/"decepticon-core"/"decepticon-core=='"$version"'"/' \
+              packages/decepticon/pyproject.toml \
+              packages/decepticon-sdk/pyproject.toml
+          sed -i 's/"decepticon"/"decepticon=='"$version"'"/' \
+              packages/decepticon-sdk/pyproject.toml
 
       - name: Build three workspace wheels + sdists
         run: |
@@ -117,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           sha256sum docker-compose.yml config/litellm.yaml .env.example > config-checksums.txt
-          sha256sum integrations/agent-skills/decepticon/SKILL.md integrations/agent-skills/decepticon/reference.md integrations/agent-skills/decepticon/examples.md > agent-skill-checksums.txt
+          sha256sum skills/decepticon/SKILL.md skills/decepticon/reference.md skills/decepticon/examples.md > agent-skill-checksums.txt
           cat config-checksums.txt
 
       - name: Upload integrity manifests to draft release
@@ -210,6 +215,20 @@ jobs:
             ghcr.io/bittersecurity/${{ matrix.image }}:${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify shipped CLI package version
+        if: matrix.image == 'decepticon-cli'
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          actual="$(docker run --rm --platform linux/amd64 --entrypoint node \
+            "ghcr.io/bittersecurity/decepticon-cli:${EXPECTED_VERSION}" \
+            -p "require('/app/package.json').version")"
+          if [[ "${actual}" != "${EXPECTED_VERSION}" ]]; then
+            echo "::error::CLI image package version ${actual} does not match ${EXPECTED_VERSION}"
+            exit 1
+          fi
 
       - name: Cosign sign image (keyless)
         env:
@@ -699,6 +718,31 @@ jobs:
             echo "Promoting ${src} → ${dst}"
             docker buildx imagetools create --tag "${dst}" "${src}"
           done
+
+      - name: Attach digest-pinned image manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          images=(
+            decepticon-litellm
+            decepticon-langgraph
+            decepticon-sandbox
+            decepticon-cli
+            decepticon-skillogy
+            decepticon-c2-sliver
+            decepticon-rea
+            decepticon-web
+          )
+          : > image-digests.txt
+          for img in "${images[@]}"; do
+            ref="ghcr.io/bittersecurity/${img}:${VERSION}"
+            digest="$(docker buildx imagetools inspect "${ref}" --format '{{.Manifest.Digest}}')"
+            [[ "${digest}" =~ ^sha256:[[:xdigit:]]{64}$ ]]
+            printf '%s@%s\n' "${ref}" "${digest}" >> image-digests.txt
+          done
+          gh release upload "v${VERSION}" image-digests.txt --clobber
 
       - name: Publish GitHub release (undraft)
         env:

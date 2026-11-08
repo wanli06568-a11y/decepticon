@@ -28,16 +28,24 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
+from decepticon.llm.model_contracts import (
+    PUBLISHER_OUTPUT_LIMITS,
+    ROUTE_OUTPUT_DEFAULTS,
+    ROUTE_SAMPLING_EXCLUSIONS,
+    RUNTIME_DEFINED_PROVIDERS,
+)
 from decepticon.llm.router import ModelRouter
 from decepticon_core.registry import RoleRegistry
 from decepticon_core.types.llm import (
+    AGENT_TEMPERATURES,
     AGENT_TIERS,
     AuthMethod,
     Credentials,
@@ -53,19 +61,20 @@ from decepticon_core.utils.logging import get_logger
 log = get_logger("llm.factory")
 
 
-# Output-token cap for every model created through this factory.
-# We must set one explicitly: the LiteLLM proxy applies the Anthropic default
+# Output-token defaults for models created through this factory.
+# Claude needs an explicit cap: the LiteLLM proxy applies the Anthropic default
 # of 4096 when the client sends no ``max_tokens``, and a single large
 # ``write_file`` tool call (e.g. a full finding report or a recon target model)
 # then truncates mid-argument — the tool-call JSON never closes, so the
 # ``content`` arg is dropped and the write fails. The cap is per-model: we hand
-# each model its OWN max-output ceiling so a big deliverable completes in one
-# call. It is a ceiling, not a forced value — short replies cost nothing extra.
-# Values above 64k require the streaming API path (the SDK already streams).
-# Authoritative caps (see ``_model_max_output_tokens``): Claude Fable 5,
-# Opus 4/5, Sonnet 4/5, and GPT-6 = 128000; Claude Haiku 4.5 = 64000. Unknown models fall back
-# to the safe 64k default. Override with ``DECEPTICON_LLM_MAX_TOKENS`` (an
-# explicit value wins over the per-model resolution).
+# reviewed routes their own defaults so a big deliverable can complete in one
+# call. A cap is not a forced value — short replies cost nothing extra.
+# Some providers require streaming for large caps (the SDK already streams).
+# Reviewed high-output Claude versions are explicit below: family names alone
+# are not a capability contract (Opus/Sonnet 4.5 support only 64000).
+# Unknown cloud routes retain the 64k fallback; local/custom deployments use
+# their server default because their actual model/context is unknown. A positive
+# ``DECEPTICON_LLM_MAX_TOKENS`` explicitly overrides the model default.
 DEFAULT_LLM_MAX_TOKENS = 64000
 LLM_MAX_TOKENS_ENV = "DECEPTICON_LLM_MAX_TOKENS"
 
@@ -85,36 +94,76 @@ LLM_DISABLE_STREAMING_ENV = "DECEPTICON_LLM_DISABLE_STREAMING"
 _PROTECTED_EXTRA_HEADERS = frozenset({"authorization", "host", "content-length"})
 
 
-def _model_max_output_tokens(model: str) -> int:
-    """Return ``model``'s own max-output-token ceiling.
+# Keep the reviewed model/version list separate from provider routing. These
+# identities cover current public and subscription routes; adding a new route
+# never gives an unknown family member an unverified larger output ceiling.
+_CLAUDE_128K_MODELS = frozenset(
+    {
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    }
+)
 
-    Match on the model slug suffix (last path segment) so every namespace we
-    route through resolves the same — ``anthropic/claude-opus-4-8``,
-    ``auth/claude-opus-4-8``, ``openrouter/anthropic/claude-sonnet-4-6``.
-    Fable 5, Opus 4/5, Sonnet 4/5, and GPT-6 support 128000 output tokens; Haiku 4.5
-    supports 64000. Unknown / non-Claude models fall back to the safe 64k
-    default rather than an over-large value the upstream might reject.
+
+def _claude_model_base(model: str) -> str:
+    """Normalize a Claude version without changing the actual routed model ID.
+
+    Accept provider namespaces, dotted versions, dated API/Vertex snapshots and
+    Bedrock model IDs. Full matching prevents e.g. 4.50 from becoming 4.5.
     """
     slug = model.rsplit("/", 1)[-1].lower()
-    if (
-        "opus" in slug
-        or "sonnet" in slug
-        or slug.startswith("claude-fable-5")
-        or _model_uses_responses_api(model)
-    ):
-        return 128000
-    if "haiku" in slug:
+    slug = re.sub(r"^(?:(?:us|eu|apac|global)\.)?anthropic\.", "", slug)
+    match = re.fullmatch(
+        r"(claude-(?:opus|sonnet|haiku|fable)-\d+(?:[-.]\d{1,2})?)"
+        r"(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?",
+        slug,
+    )
+    return match[1].replace(".", "-") if match else ""
+
+
+def _model_max_output_tokens(model: str) -> int:
+    """Resolve a cloud-route default, preserving provider-specific limits.
+
+    Opus/Sonnet 4.5 and Haiku 4.5 use 64000. Reviewed newer Claude models and
+    GPT-6 use 128000. Exact reviewed route defaults take precedence. Unknown
+    cloud models keep the existing 64k fallback, which is
+    not a guarantee of arbitrary providers' limits; operators can override it.
+    """
+    route = model.lower()
+    publisher_limit = PUBLISHER_OUTPUT_LIMITS.get(route.rsplit("/", 1)[-1])
+    if route in ROUTE_OUTPUT_DEFAULTS:
+        route_limit = ROUTE_OUTPUT_DEFAULTS[route]
+        return min(route_limit, publisher_limit) if publisher_limit is not None else route_limit
+    if publisher_limit is not None:
+        return min(DEFAULT_LLM_MAX_TOKENS, publisher_limit)
+    # AWS's Sonnet 4.6 contract is 64K; Anthropic/OpenRouter allow 128K.
+    # Normalize regional inference profiles and pinned IDs only after checking
+    # the provider, so the lower AWS limit never leaks into another gateway.
+    if route.startswith("bedrock/") and _claude_model_base(model) == "claude-sonnet-4-6":
         return 64000
+    if _claude_model_base(model) in _CLAUDE_128K_MODELS or _model_uses_responses_api(model):
+        return 128000
     return DEFAULT_LLM_MAX_TOKENS
 
 
-def _resolve_max_tokens(model: str) -> int:
+def _resolve_max_tokens(model: str, role_cap: int | None = None) -> int | None:
     """Output-token cap for a factory-created model.
 
     ``DECEPTICON_LLM_MAX_TOKENS`` (explicit override) wins when set to a
-    positive int; otherwise the model's own max-output ceiling is used so a
-    large single-call deliverable (finding report, recon model) never truncates
-    at the proxy's 4096 default.
+    positive int, followed by a positive role-assignment cap, then the reviewed
+    route default or existing cloud fallback. Local/custom deployments omit the
+    cap when no explicit override exists so their server chooses a
+    value appropriate to the loaded model/context. This does not reserve room
+    for the prompt or guarantee that a large deliverable fits in one response.
     """
     raw = os.environ.get(LLM_MAX_TOKENS_ENV)
     if raw:
@@ -124,6 +173,10 @@ def _resolve_max_tokens(model: str) -> int:
             value = 0
         if value > 0:
             return value
+    if role_cap is not None and role_cap > 0:
+        return role_cap
+    if model.split("/", 1)[0].lower() in RUNTIME_DEFINED_PROVIDERS:
+        return None
     return _model_max_output_tokens(model)
 
 
@@ -268,6 +321,8 @@ _DEFAULT_AUTH_PRIORITY: tuple[AuthMethod, ...] = (
     AuthMethod.HUGGINGFACE_API,
     AuthMethod.QIANFAN_API,
     AuthMethod.CLOUDFLARE_GATEWAY_API,
+    AuthMethod.CHEAPER_INFERENCE_API,
+    AuthMethod.OPENAI_COMPAT_GATEWAY_API,
     AuthMethod.OLLAMA_LOCAL,
     AuthMethod.OLLAMA_CLOUD,
 )
@@ -320,6 +375,7 @@ _API_METHOD_ENV: dict[AuthMethod, str] = {
     AuthMethod.ZENMUX_API: "ZENMUX_API_KEY",
     AuthMethod.QIANFAN_API: "QIANFAN_API_KEY",
     AuthMethod.CLOUDFLARE_GATEWAY_API: "CLOUDFLARE_AI_GATEWAY_API_KEY",
+    AuthMethod.CHEAPER_INFERENCE_API: "CHEAPER_INFERENCE_API_KEY",
 }
 
 _OAUTH_METHOD_ENV: dict[AuthMethod, str] = {
@@ -347,6 +403,8 @@ _KEY_PREFIX_HINTS: dict[AuthMethod, tuple[str, ...]] = {
     AuthMethod.GITHUB_MODELS_API: ("ghp_", "github_pat_", "gho_", "ghs_"),
     # Kimi for Coding keys ship as sk-kimi-...; accept plain sk- too.
     AuthMethod.KIMI_API: ("sk-kimi-", "sk-"),
+    # Cheaper Inference keys ship as ci_live_...
+    AuthMethod.CHEAPER_INFERENCE_API: ("ci_live_",),
 }
 
 # Substring tokens that mark a value as obviously not a real key.
@@ -469,6 +527,33 @@ def _custom_openai_configured() -> bool:
     base = os.getenv("CUSTOM_OPENAI_API_BASE", "").strip()
     key = os.getenv("CUSTOM_OPENAI_API_KEY", "")
     return bool(base) and _is_real_key(key)
+
+
+def _openai_compat_gateway_configured() -> bool:
+    """Return True when the generic OpenAI-compatible gateway is opted in.
+
+    Requires ``OPENAI_COMPAT_GATEWAY_API_BASE`` (URL), a real
+    ``OPENAI_COMPAT_GATEWAY_API_KEY``, and at least one model via
+    ``OPENAI_COMPAT_GATEWAY_MODEL`` or ``OPENAI_COMPAT_GATEWAY_MODEL_*``.
+    All three are required so a stock .env with placeholder comments stays
+    DEFAULT OFF — no vendor endpoint is contacted until the operator opts in.
+    """
+    base = os.getenv("OPENAI_COMPAT_GATEWAY_API_BASE", "").strip()
+    key = os.getenv("OPENAI_COMPAT_GATEWAY_API_KEY", "")
+    try:
+        endpoint = urlsplit(base)
+        port = endpoint.port
+    except ValueError:
+        return False
+    if (
+        endpoint.scheme not in {"http", "https"}
+        or not endpoint.hostname
+        or port == 0
+        or any(c.isspace() for c in base)
+    ):
+        return False
+    credentials = Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
+    return _is_real_key(key) and any(resolve_chain(tier, credentials) for tier in Tier)
 
 
 def _is_real_key(value: str, method: AuthMethod | None = None) -> bool:
@@ -613,6 +698,8 @@ def _method_is_configured(method: AuthMethod) -> bool:
         return _llamacpp_local_configured()
     if method == AuthMethod.CUSTOM_OPENAI_API:
         return _custom_openai_configured()
+    if method == AuthMethod.OPENAI_COMPAT_GATEWAY_API:
+        return _openai_compat_gateway_configured()
     return False
 
 
@@ -658,6 +745,9 @@ def _fallback_credentials(*, priority_explicit: bool) -> Credentials:
     if _custom_openai_configured():
         log.info("Only CUSTOM_OPENAI_* detected; using custom OpenAI-compatible endpoint")
         return Credentials(methods=[AuthMethod.CUSTOM_OPENAI_API])
+    if _openai_compat_gateway_configured():
+        log.info("Only OPENAI_COMPAT_GATEWAY_* detected; using generic OpenAI-compatible gateway")
+        return Credentials(methods=[AuthMethod.OPENAI_COMPAT_GATEWAY_API])
     if priority_explicit:
         # User expressed clear intent (set DECEPTICON_AUTH_PRIORITY) but
         # every listed method failed detection. Surface the root cause
@@ -737,6 +827,7 @@ _LOCAL_METHOD_ENV: dict[AuthMethod, str] = {
     AuthMethod.LMSTUDIO_LOCAL: "LMSTUDIO_API_BASE",
     AuthMethod.LLAMACPP_LOCAL: "LLAMACPP_API_BASE",
     AuthMethod.CUSTOM_OPENAI_API: "CUSTOM_OPENAI_API_BASE",
+    AuthMethod.OPENAI_COMPAT_GATEWAY_API: "OPENAI_COMPAT_GATEWAY_API_KEY",
 }
 
 _METHOD_LABEL: dict[AuthMethod, str] = {
@@ -775,6 +866,8 @@ _METHOD_LABEL: dict[AuthMethod, str] = {
     AuthMethod.ZENMUX_API: "ZenMux — API key",
     AuthMethod.QIANFAN_API: "Baidu Qianfan (ERNIE) — API key",
     AuthMethod.CLOUDFLARE_GATEWAY_API: "Cloudflare AI Gateway — API key + base URL",
+    AuthMethod.CHEAPER_INFERENCE_API: "Cheaper Inference — API key",
+    AuthMethod.OPENAI_COMPAT_GATEWAY_API: "OpenAI-compatible gateway — base URL + key (opt-in)",
     AuthMethod.COPILOT_OAUTH: "GitHub Copilot — Pro subscription",
     AuthMethod.GROK_OAUTH: "xAI SuperGrok — X Premium+",
     AuthMethod.PERPLEXITY_OAUTH: "Perplexity — Pro subscription",
@@ -920,6 +1013,31 @@ class _ProxiedChatOpenAI(ChatOpenAI):
          out the original message and rewrap it.
     """
 
+    def _get_request_payload(
+        self, input_: LanguageModelInput, *, stop: list[str] | None = None, **kwargs: Any
+    ) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # LangChain applies disabled_params during helper/tool binding, but
+        # explicit invoke kwargs can otherwise put forbidden fields back on
+        # the wire. Enforce unconditional exclusions after serialization too.
+        for name, values in (self.disabled_params or {}).items():
+            if values is None:
+                payload.pop(name, None)
+        extra_body = payload.get("extra_body")
+        if isinstance(extra_body, dict):
+            # The OpenAI SDK merges extra_body into the final JSON object.
+            # Copy it so filtering never mutates a caller's reusable dict.
+            payload["extra_body"] = {
+                name: value
+                for name, value in extra_body.items()
+                if name not in (self.disabled_params or {})
+                or (self.disabled_params or {})[name] is not None
+            }
+        if self.disable_streaming == "tool_calling" and payload.get("tools"):
+            payload["stream"] = False
+            payload.pop("stream_options", None)
+        return payload
+
     def invoke(self, *args, **kwargs):
         try:
             result = super().invoke(*args, **kwargs)
@@ -1009,7 +1127,7 @@ def _log_served_model(requested: str, result: object) -> None:
 def _model_drops_temperature(model: str) -> bool:
     """Return True if the LiteLLM model id rejects the ``temperature`` param.
 
-    Current Claude Fable/Opus/Sonnet 5.5, Gemini 3.8 Flash, and GPT-6 models
+    Current Claude Fable/Opus/Sonnet/Haiku 5.5, Gemini 3.8 Flash, and GPT-6 models
     reject sampling parameters. Match model families across every namespace:
 
       anthropic/claude-opus-4-7
@@ -1020,11 +1138,21 @@ def _model_drops_temperature(model: str) -> bool:
     keeps this honest for openrouter-mirrored variants and any future
     Opus 4.x build added to METHOD_MODELS.
     """
-    slug = model.rsplit("/", 1)[-1].lower()
+    slug = _claude_model_base(model) or model.rsplit("/", 1)[-1].lower()
     return (
-        slug.startswith(("claude-opus-4", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5"))
+        model.lower() in ROUTE_SAMPLING_EXCLUSIONS
+        or slug.startswith(
+            (
+                "claude-opus-4",
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-fable-5",
+                "claude-haiku-5-5",
+            )
+        )
         or _model_is_kimi_coding(model)
         or model.endswith("/gemini-3.8-flash")
+        or model.startswith("openai/gpt-5.6-")
         or _model_uses_responses_api(model)
     )
 
@@ -1035,8 +1163,10 @@ def _model_uses_responses_api(model: str) -> bool:
 
 
 def _model_is_claude_adaptive(model: str) -> bool:
-    slug = model.rsplit("/", 1)[-1].lower()
-    return slug.startswith(("claude-fable-5", "claude-opus-5", "claude-sonnet-5-5"))
+    slug = _claude_model_base(model)
+    return slug.startswith(
+        ("claude-fable-5", "claude-opus-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+    )
 
 
 def _model_is_kimi_coding(model: str) -> bool:
@@ -1114,7 +1244,7 @@ class _DeepSeekThinkingChatOpenAI(_ProxiedChatOpenAI):
         extra_body = payload.get("extra_body") or {}
         extra_body["thinking"] = {"type": "enabled"}
         payload["extra_body"] = extra_body
-        payload["reasoning_effort"] = "high"
+        payload.setdefault("reasoning_effort", "high")
 
         # Walk the messages array and inject reasoning_content from
         # additional_kwargs back into assistant message dicts so the
@@ -1375,6 +1505,19 @@ _FATAL_STATUS = frozenset({400, 401, 403, 404})
 # LiteLLM/openai surface the upstream status only in the body text.
 _STATUS_IN_MSG = re.compile(r"(?:error\s*code|status(?:_code)?|http)\D{0,8}(\d{3})", re.I)
 
+# Gateways can wrap a provider policy refusal in HTTP 500 and append their
+# entire fallback configuration. The policy signal takes precedence over that
+# wrapper status; a different authentication order does not grant policy access.
+_POLICY_REJECTION = re.compile(
+    r"\b(?:cyber_policy|content_policy_violation|ContentPolicyViolationError)\b"
+    r"|flagged for possible cybersecurity risk",
+    re.I,
+)
+
+
+def _is_provider_policy_rejection(exc: BaseException) -> bool:
+    return bool(_POLICY_REJECTION.search(f"{type(exc).__name__}: {exc}"))
+
 
 def _provider_status_code(exc: BaseException) -> int | None:
     status = getattr(exc, "status_code", None)
@@ -1397,6 +1540,8 @@ def _classify_provider_error(exc: BaseException) -> ProviderErrorClass:
     behavior (LiteLLM ``num_retries`` keeps spinning). Only flip to ``fatal``
     on a positive 4xx signal.
     """
+    if _is_provider_policy_rejection(exc):
+        return "fatal"
     if isinstance(exc, LLMTimeoutError):
         return "retryable"
     if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
@@ -1451,6 +1596,22 @@ def _reraise_with_actionable_message(exc: Exception, model_name: str) -> None:
       - 404 NotFoundError (model not registered in litellm.yaml)
       - 429 RateLimitError (provider quota hit)
     """
+    if _is_provider_policy_rejection(exc):
+        route_hint = (
+            " This auth/ route uses subscription/OAuth access; API-project Daybreak "
+            "approval does not establish access on this product surface."
+            if model_name.startswith("auth/")
+            else " For approved API Daybreak access, verify the exact project and model."
+        )
+        raise RuntimeError(
+            f"non-retryable provider policy rejection: Model '{model_name}' was "
+            "blocked by the upstream provider's cybersecurity/content safeguards. "
+            "Review the request and verify access for this account, model and product "
+            f"surface.{route_hint} Changing authentication priority is not a policy-access "
+            "fix. Details: decepticon logs litellm. "
+            "https://developers.openai.com/api/docs/guides/safety-checks/cybersecurity"
+        ) from exc
+
     _reraise_if_connection_error(exc)
 
     err_type = type(exc).__name__
@@ -1522,6 +1683,26 @@ def _reraise_with_actionable_message(exc: Exception, model_name: str) -> None:
             f"(region lock, plan tier, or org policy). Verify your account "
             f"can use that model, or route to another method via "
             f"DECEPTICON_AUTH_PRIORITY.\nUnderlying: {safe_msg}"
+        ) from exc
+
+    # LiteLLM raises RouterRateLimitError ("No deployments available ...
+    # cooldown_list=[...]") once it has *cooled down* a deployment after
+    # repeated failures. That cooldown is frequently triggered by a FATAL
+    # upstream error (e.g. a 404 model_not_found or a 401) on the previous
+    # attempt, not a true quota rate limit — but the outer error still reads
+    # "429", so the plain rate-limit branch below would mislabel it and hide the
+    # real cause. Surface it distinctly and point at the proxy logs where the
+    # cooled-down deployment's underlying exception is recorded. See issue:
+    # a 404 from a custom OpenAI endpoint surfaced to the user as a 429.
+    if "no deployments available" in msg_lower or "cooldown" in msg_lower:
+        raise RuntimeError(
+            f"Model '{model_name}' has no available deployments — LiteLLM cooled it "
+            f"down after repeated failures. This is usually a masked upstream error "
+            f"(e.g. a 400/401/404 from the provider on the previous attempt), not a true "
+            f"quota rate limit, so retrying alone may not clear it. Check the LiteLLM "
+            f"proxy logs for the cooled-down deployment's underlying exception and fix the "
+            f"root cause (model id, endpoint URL, or credentials), or add a fallback "
+            f"method to DECEPTICON_AUTH_PRIORITY.\nUnderlying: {safe_msg}"
         ) from exc
 
     if "ratelimit" in err_type.lower() or "code: 429" in msg_lower:
@@ -1620,8 +1801,23 @@ class LLMFactory:
         apply_role_overrides: bool = True,
     ):
         self._proxy = proxy or self._resolve_proxy_config()
+        desktop_model = os.environ.get("DECEPTICON_DESKTOP_MODEL", "").strip()
         if mapping is not None:
             self._mapping = mapping
+        elif desktop_model and apply_role_overrides:
+            # Desktop Local selects one route for this run.  Building the
+            # mapping directly also supports providers without every tier in
+            # the profile; no unrelated credential chain can be inherited.
+            self._mapping = LLMModelMapping(
+                assignments={
+                    role: ModelAssignment(
+                        primary=desktop_model,
+                        fallbacks=[],
+                        temperature=AGENT_TEMPERATURES.get(role, 0.7),
+                    )
+                    for role in AGENT_TIERS
+                }
+            )
         else:
             creds = credentials if credentials is not None else _resolve_credentials()
             raw_profile = profile if profile is not None else self._resolve_profile()
@@ -1646,6 +1842,14 @@ class LLMFactory:
         """
         from decepticon.agents.build import resolve_role_model
 
+        desktop_model = os.environ.get("DECEPTICON_DESKTOP_MODEL", "").strip()
+        if desktop_model:
+            return ModelAssignment(
+                primary=desktop_model,
+                fallbacks=[],
+                temperature=assignment.temperature,
+                max_tokens=assignment.max_tokens,
+            )
         override = resolve_role_model(role)
         if not override or override == assignment.primary:
             return assignment
@@ -1653,6 +1857,7 @@ class LLMFactory:
             primary=override,
             fallbacks=[assignment.primary, *(m for m in assignment.fallbacks if m != override)],
             temperature=assignment.temperature,
+            max_tokens=assignment.max_tokens,
         )
 
     @staticmethod
@@ -1732,7 +1937,9 @@ class LLMFactory:
             _redact_url_credentials(self._proxy.url),
         )
 
-        model = self._create_chat_model(assignment.primary, assignment.temperature)
+        model = self._create_chat_model(
+            assignment.primary, assignment.temperature, assignment.max_tokens
+        )
         self._cache[role] = model
         return model
 
@@ -1747,9 +1954,9 @@ class LLMFactory:
         until one succeeds. ``default_role`` works as in ``get_model``.
         """
         default_role = self._resolve_default_role(role, default_role)
-        assignment = self._compose_assignment(
-            role, self._router.get_assignment(role, default_role=default_role)
-        )
+        assignment = self._router.get_assignment(role, default_role=default_role)
+        if self._apply_role_overrides:
+            assignment = self._compose_assignment(role, assignment)
         if not assignment.fallbacks:
             return []
 
@@ -1760,10 +1967,13 @@ class LLMFactory:
             assignment.fallbacks,
         )
         return [
-            self._create_chat_model(model, assignment.temperature) for model in assignment.fallbacks
+            self._create_chat_model(model, assignment.temperature, assignment.max_tokens)
+            for model in assignment.fallbacks
         ]
 
-    def _create_chat_model(self, model: str, temperature: float) -> BaseChatModel:
+    def _create_chat_model(
+        self, model: str, temperature: float | None, max_tokens: int | None = None
+    ) -> BaseChatModel:
         """Create a proxied ChatOpenAI instance routed through LiteLLM proxy.
 
         Claude Opus 4.7+ rejects ``temperature`` with a 400 invalid_request
@@ -1790,7 +2000,7 @@ class LLMFactory:
             "max_retries": self._proxy.max_retries,
             # Per-model cap so large single-call deliverables (finding reports,
             # recon target models) don't truncate at the proxy's 4096 default.
-            "max_tokens": _resolve_max_tokens(model),
+            "max_tokens": _resolve_max_tokens(model, max_tokens),
             # Stream the completion even when the agent calls ``invoke()``.
             # LangChain only emits ``on_llm_new_token`` when the underlying
             # request streams, and LangGraph's "messages" stream mode is built
@@ -1815,7 +2025,10 @@ class LLMFactory:
         if _model_uses_responses_api(model):
             kwargs["use_responses_api"] = True
         if _model_drops_temperature(model):
-            kwargs["disabled_params"] = {"temperature": None}
+            kwargs["disabled_params"] = {
+                name: None
+                for name in ROUTE_SAMPLING_EXCLUSIONS.get(model.lower(), ("temperature",))
+            }
             if model.endswith("/gemini-3.8-flash") or _model_is_claude_adaptive(model):
                 kwargs["disabled_params"].update({"top_p": None, "top_k": None})
         elif _model_is_deepseek_thinking(model):

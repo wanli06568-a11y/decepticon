@@ -1,6 +1,6 @@
 """FastAPI application for the sandbox HTTP daemon.
 
-Wraps a `DaemonSandbox` (the `SandboxBase` subclass that runs every
+Wraps a `DaemonSandbox` (the `SandboxKernel` subclass that runs every
 subprocess without the `docker exec <container>` prefix because the
 daemon already lives *inside* the sandbox container) and exposes its
 methods over HTTP. The wire surface mirrors the in-process surface 1:1:
@@ -8,17 +8,17 @@ methods over HTTP. The wire surface mirrors the in-process surface 1:1:
   - `/execute`                  → BaseSandbox.execute
   - `/upload_files`             → BaseSandbox.upload_files
   - `/download_files`           → BaseSandbox.download_files
-  - `/execute_tmux`             → SandboxBase.execute_tmux
-  - `/start_background`         → SandboxBase.start_background
-  - `/poll_completion`          → SandboxBase.poll_completion
-  - `/kill_session`             → SandboxBase.kill_session
-  - `/read_session_log_diff`    → SandboxBase.read_session_log_diff
-  - `/reset_session_log_offset` → SandboxBase.reset_session_log_offset
-  - `/session_log_path`         → SandboxBase.session_log_path
+  - `/execute_tmux`             → SandboxKernel.execute_tmux
+  - `/start_background`         → SandboxKernel.start_background
+  - `/poll_completion`          → SandboxKernel.poll_completion
+  - `/kill_session`             → SandboxKernel.kill_session
+  - `/read_session_log_diff`    → SandboxKernel.read_session_log_diff
+  - `/reset_session_log_offset` → SandboxKernel.reset_session_log_offset
+  - `/session_log_path`         → SandboxKernel.session_log_path
 
 The agent's tmux session state lives inside this daemon process (via
 the shared `TmuxSessionManager._initialized` + `DaemonSandbox._jobs`
-class vars). `HTTPSandbox` on the agent side just forwards calls; the
+class vars). `HTTPTransportSandbox` on the agent side just forwards calls; the
 PS1 marker / size watchdog / auto-background semantics all happen here
 where they always did, just no longer behind a docker socket.
 
@@ -107,7 +107,7 @@ class DownloadFilesResponse(BaseModel):
 # ── tmux / background surface — wraps DockerSandbox.execute_tmux,
 # start_background, poll_completion, etc. These are the methods the
 # bash tool consumes, so once they're up the LLM-driven bash chain
-# transparently works through HTTPSandbox. ───────────────────────────
+# transparently works through HTTPTransportSandbox. ───────────────────────────
 
 
 class ExecuteTmuxRequest(BaseModel):
@@ -120,6 +120,10 @@ class ExecuteTmuxRequest(BaseModel):
 
 class ExecuteTmuxResponseModel(BaseModel):
     output: str
+
+
+class ExecuteTmuxAsyncResponseModel(ExecuteTmuxResponseModel):
+    background: bool = False
 
 
 class StartBackgroundRequest(BaseModel):
@@ -156,23 +160,6 @@ class SessionLogDiffResponseModel(BaseModel):
 
 class SessionLogPathResponseModel(BaseModel):
     path: str
-
-
-class ProvisionEgressRequest(BaseModel):
-    policy: dict = Field(
-        description="Serialized EgressPolicy "
-        "(decepticon.sandbox_kernel.egress.EgressPolicy.to_dict()): the "
-        "compiled in-scope / out-of-scope / forbidden destinations.",
-    )
-
-
-class ProvisionEgressResponseModel(BaseModel):
-    applied: bool
-    enforce: bool
-    detail: str
-    management_cidrs: list[str]
-    resolved_host_ips: list[str]
-    dns_allowlist: list[str]
 
 
 # ── Module-level singletons. These live for the daemon's lifetime; we
@@ -250,7 +237,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # survive but no live manager tracks them); without this reap they
     # accumulate forever and can collide with new session names on the
     # next engagement attempt. Scoped to decepticon-named sockets
-    # only — see SandboxBase.reap_orphaned_tmux_sessions docstring.
+    # only — see SandboxKernel.reap_orphaned_tmux_sessions docstring.
     try:
         reaped = backend.reap_orphaned_tmux_sessions()
         if reaped:
@@ -271,7 +258,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Decepticon sandbox daemon",
-    summary="HTTP transport for the DaemonSandbox surface. Pairs with HTTPSandbox.",
+    summary="HTTP transport for the DaemonSandbox surface. Pairs with HTTPTransportSandbox.",
     lifespan=lifespan,
 )
 
@@ -280,11 +267,16 @@ app = FastAPI(
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+def healthz() -> dict[str, str | int]:
     """Cheap liveness probe. Cloud Run / Kubernetes startup probes
     should target this — it doesn't touch the backend so it stays
     green even during a long-running command."""
-    return {"status": "ok"}
+    result: dict[str, str | int] = {"status": "ok"}
+    if os.environ.get("DECEPTICON_MANAGED_SESSION") == "1":
+        from decepticon.sandbox_server.managed_start import process_identity
+
+        result.update(pid=os.getpid(), start=process_identity(os.getpid()) or "")
+    return result
 
 
 # ── BaseSandbox surface ───────────────────────────────────────────────
@@ -355,6 +347,32 @@ def execute_tmux(
         workspace_path=req.workspace_path,
     )
     return ExecuteTmuxResponseModel(output=output)
+
+
+@app.post("/execute_tmux_async", response_model=ExecuteTmuxAsyncResponseModel)
+async def execute_tmux_async(
+    req: ExecuteTmuxRequest,
+    _: Annotated[None, Depends(auth)],
+) -> ExecuteTmuxAsyncResponseModel:
+    """Use the canonical async waiter so auto-background jobs are registered."""
+    backend = _get_backend()
+    output = await backend.execute_tmux_async(
+        command=req.command,
+        session=req.session,
+        timeout=req.timeout,
+        is_input=req.is_input,
+        workspace_path=req.workspace_path,
+    )
+    effective_workspace = backend._normalize_workspace_path(
+        req.workspace_path or backend._workspace_path
+    )
+    job = backend._jobs.get(req.session, key=backend._manager_key(req.session, effective_workspace))
+    return ExecuteTmuxAsyncResponseModel(
+        output=output,
+        background=output.startswith("[AUTO-BACKGROUND]")
+        and job is not None
+        and job.status == "running",
+    )
 
 
 @app.post("/start_background", response_model=dict)
@@ -439,51 +457,6 @@ def reset_session_log_offset(
         workspace_path=req.workspace_path,
     )
     return {"status": "ok"}
-
-
-def _egress_enforcement_enabled() -> bool:
-    """Whether the sandbox applies egress rules — default ON, opt-out.
-
-    Decided sandbox-side (its own env, not trusted from the wire). The
-    egress firewall loads by default for any enforcing policy; an operator
-    whose environment it doesn't fit sets ``DECEPTICON_EGRESS_DISABLE=1``
-    on the sandbox container to fall back to the parser layer alone. The
-    management plane is discovered locally, so default-on can't sever the
-    agent↔management (Neo4j / daemon) link.
-    """
-    return os.environ.get("DECEPTICON_EGRESS_DISABLE", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-    }
-
-
-@app.post("/provision_egress", response_model=ProvisionEgressResponseModel)
-def provision_egress(
-    req: ProvisionEgressRequest,
-    _: Annotated[None, Depends(auth)],
-) -> ProvisionEgressResponseModel:
-    """Apply the Layer-2 RoE egress guardrail (nftables connect-allowlist).
-
-    Reconstructs the agent-compiled ``EgressPolicy``, folds in the
-    locally-discovered management plane + resolver + resolved host IPs,
-    and loads the ruleset via ``nft``. Default ON for an enforcing
-    policy; an operator can opt out with ``DECEPTICON_EGRESS_DISABLE``,
-    in which case it returns the rendered ruleset for inspection without
-    touching the network.
-    """
-    from decepticon.sandbox_kernel.egress import EgressPolicy, apply_egress
-
-    policy = EgressPolicy.from_dict(req.policy)
-    result = apply_egress(policy, enabled=_egress_enforcement_enabled())
-    return ProvisionEgressResponseModel(
-        applied=result.applied,
-        enforce=result.enforce,
-        detail=result.detail,
-        management_cidrs=list(result.management_cidrs),
-        resolved_host_ips=list(result.resolved_host_ips),
-        dns_allowlist=list(result.dns_allowlist),
-    )
 
 
 @app.post("/session_log_path", response_model=SessionLogPathResponseModel)

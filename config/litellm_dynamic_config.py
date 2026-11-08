@@ -22,8 +22,33 @@ import os
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
+
+_CURRENT_MODEL_CATALOG = Path(__file__).with_name("litellm_prod_catalog.json")
+
+
+def _configured_credential(value: str | None) -> bool:
+    candidate = (value or "").strip()
+    return bool(candidate and not candidate.startswith(("your-", "YOUR-")))
+
+
+def current_model_routes(env: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+    source = env if env is not None else os.environ
+    catalog = json.loads(_CURRENT_MODEL_CATALOG.read_text(encoding="utf-8"))
+    enabled: list[dict[str, Any]] = []
+    for route in catalog["routes"]:
+        params = route["litellm_params"]
+        required = [
+            value.removeprefix("os.environ/")
+            for field in ("api_key", "api_base")
+            if isinstance(value := params.get(field), str) and value.startswith("os.environ/")
+        ]
+        if all(_configured_credential(source.get(name)) for name in required):
+            enabled.append(copy.deepcopy(route))
+    return enabled
+
 
 # Common LiteLLM provider prefix -> environment variable containing the API key.
 # Unknown providers fall back to ``<PROVIDER>_API_KEY`` after normalization, which
@@ -191,6 +216,18 @@ OPENAI_COMPAT_GATEWAYS: dict[str, tuple[str, str]] = {
     # request time, so an unset base only fails the call (with a clear 404),
     # never proxy startup.
     "cfgateway": ("os.environ/CLOUDFLARE_AI_GATEWAY_API_BASE", "CLOUDFLARE_AI_GATEWAY_API_KEY"),
+    # Cheaper Inference (api.cheaperinference.com). One key gives access to
+    # models from several labs; fixed OpenAI-compatible endpoint.
+    "cheaperinference": ("https://api.cheaperinference.com/v1", "CHEAPER_INFERENCE_API_KEY"),
+    # Generic opt-in OpenAI-compatible gateway. BOTH api_base and api_key
+    # come from the environment — no vendor URL is hardcoded. Unset env
+    # vars leave this gateway disabled (DEFAULT OFF). Operators point
+    # OPENAI_COMPAT_GATEWAY_API_BASE at any OpenAI-compatible /v1 endpoint
+    # (self-hosted proxy, third-party aggregator, etc.). See #989.
+    "compat": (
+        "os.environ/OPENAI_COMPAT_GATEWAY_API_BASE",
+        "OPENAI_COMPAT_GATEWAY_API_KEY",
+    ),
 }
 
 # Providers that accept SEVERAL key env-var names. Resolved at config-write
@@ -439,6 +476,62 @@ def _vllm_model_from_env(source: Mapping[str, str]) -> str | None:
     return f"hosted_vllm/{model}"
 
 
+def _clean_compat_gateway_model(value: str | None) -> str | None:
+    model = (value or "").strip()
+    slug = model.split("/", 1)[1] if model.lower().startswith("compat/") else model
+    if slug.lower() in {"", "none", "null", "-"} or any(c.isspace() for c in slug):
+        return None
+    return model if model.lower().startswith("compat/") else f"compat/{model}"
+
+
+def _compat_gateway_models_from_env(source: Mapping[str, str]) -> set[str]:
+    """Derive ``compat/<model>`` aliases when the generic gateway is wired.
+
+    Requires ``OPENAI_COMPAT_GATEWAY_API_BASE`` + ``OPENAI_COMPAT_GATEWAY_API_KEY``
+    (real key) plus at least one of ``OPENAI_COMPAT_GATEWAY_MODEL`` /
+    ``OPENAI_COMPAT_GATEWAY_MODEL_{HIGH,MID,LOW}``. DEFAULT OFF — unset
+    env registers nothing. Mirrors the OLLAMA_MODEL / VLLM_MODEL shortcuts
+    so a key-only+base deployment gets proxy routes without DECEPTICON_MODEL*.
+    """
+    base = _clean_model(source.get("OPENAI_COMPAT_GATEWAY_API_BASE"))
+    key = (source.get("OPENAI_COMPAT_GATEWAY_API_KEY") or "").strip()
+    if not base or not key:
+        return set()
+    try:
+        endpoint = urlsplit(base)
+        port = endpoint.port
+    except ValueError:
+        return set()
+    if (
+        endpoint.scheme not in {"http", "https"}
+        or not endpoint.hostname
+        or port == 0
+        or any(c.isspace() for c in base)
+    ):
+        return set()
+    # Reject obvious launcher placeholders so a stock .env does not opt in.
+    lower = key.lower()
+    if lower.startswith("your-") or lower.endswith("-key-here") or len(key) < 24:
+        return set()
+    if any(
+        token in lower
+        for token in ("placeholder", "not-used", "not_used", "dummy", "fake", "example")
+    ):
+        return set()
+    models: set[str] = set()
+    single = _clean_compat_gateway_model(source.get("OPENAI_COMPAT_GATEWAY_MODEL"))
+    for tier_env in (
+        "OPENAI_COMPAT_GATEWAY_MODEL_HIGH",
+        "OPENAI_COMPAT_GATEWAY_MODEL_MID",
+        "OPENAI_COMPAT_GATEWAY_MODEL_LOW",
+    ):
+        m = _clean_compat_gateway_model(source.get(tier_env)) or single
+        if m is None:
+            continue
+        models.add(m)
+    return models
+
+
 def collect_requested_models(env: Mapping[str, str] | None = None) -> set[str]:
     """Collect model IDs requested through DECEPTICON_MODEL* env vars.
 
@@ -465,6 +558,8 @@ def collect_requested_models(env: Mapping[str, str] | None = None) -> set[str]:
     vllm_model = _vllm_model_from_env(source)
     if vllm_model is not None:
         models.add(vllm_model)
+
+    models.update(_compat_gateway_models_from_env(source))
 
     return models
 
@@ -497,7 +592,7 @@ def validate_model_name(model_name: str) -> None:
 
     ``merge_dynamic_models`` skips this validation when the model is already
     present in the model_list, so a user setting
-    ``DECEPTICON_MODEL=auth/gpt-5.4-mini`` plus ``DECEPTICON_AUTH_CHATGPT=true``
+    ``DECEPTICON_MODEL=auth/gpt-6-luna`` plus ``DECEPTICON_AUTH_CHATGPT=true``
     is fine — the subscription path injected the route first and the requested
     model is satisfied.
     """
@@ -612,8 +707,9 @@ def build_model_entry(model_name: str) -> dict[str, Any]:
         # Xiaomi MiMo Open Platform — OpenAI-compatible
         # (``/v1/chat/completions``, Bearer auth). No native LiteLLM
         # provider yet; remap to ``openai/<id>`` and override api_base
-        # to XIAOMI_MIMO_API_BASE (default points at
-        # ``https://platform.xiaomimimo.com/v1``).
+        # to the operator's XIAOMI_MIMO_API_BASE. The public pay-as-you-go
+        # API base is ``https://api.xiaomimimo.com/v1``; the platform host
+        # serves the web console. Subscription bases remain separate.
         actual_model = model_name.split("/", 1)[1]
         params = {
             "model": f"openai/{actual_model}",
@@ -757,25 +853,7 @@ def build_model_entry(model_name: str) -> dict[str, Any]:
 # card (Sonar $1/$1, Sonar Pro $3/$15) — search-call surcharge not
 # modeled.
 _SUBSCRIPTION_SHADOW_PRICING: dict[str, tuple[float, float]] = {
-    # gpt-5.6-{sol,terra,luna} are the GPT-5.6-family frontier checkpoints the
-    # Codex subscription actually serves (all three verified 2026-07-13 via
-    # /backend-api/codex/responses; plain gpt-5.6 / gpt-5.6-nova / gpt-5.6-codex
-    # 400 with "not supported when using Codex with a ChatGPT account"). They
-    # behave equivalently on verification-reasoning probes — registered so any
-    # agent can be composed onto any of them. Shadow pricing tracks gpt-5.5
-    # ($5 input parity per the model card); opportunity-cost only — real spend
-    # is the flat subscription.
-    "auth/gpt-5.6-sol": (0.000005, 0.000030),
-    "auth/gpt-5.6-terra": (0.000005, 0.000030),
-    "auth/gpt-5.6-luna": (0.000005, 0.000030),
-    "auth/gpt-5.5": (0.000005, 0.000030),
-    "auth/gpt-5.4": (0.0000025, 0.000015),
-    "auth/gpt-5.4-mini": (0.00000075, 0.0000045),
-    "auth/gpt-5.3-codex": (0.00000175, 0.000014),
-    # gpt-5.3-codex-spark is the agentic-coding model the Codex subscription
-    # actually serves (verified 2026-06-25 via /backend-api/codex/models);
-    # gpt-5.3-codex is the API slug. Same shadow pricing.
-    "auth/gpt-5.3-codex-spark": (0.00000175, 0.000014),
+    # Codex routes omit shadow prices until model-specific rates are verified.
     "gemini-sub/gemini-2.5-pro": (0.00000125, 0.00001),
     "gemini-sub/gemini-2.5-flash": (0.0000003, 0.0000025),
     "copilot/gpt-5.5": (0.000005, 0.000030),
@@ -792,11 +870,7 @@ _SUBSCRIPTION_SHADOW_PRICING: dict[str, tuple[float, float]] = {
 def _with_shadow_pricing(route: dict[str, Any]) -> dict[str, Any]:
     """Attach ``model_info`` shadow pricing to a subscription route, if any.
 
-    Returns the route unchanged when ``model_name`` is not in
-    ``_SUBSCRIPTION_SHADOW_PRICING`` — preserves the "subscription is
-    free per-token" reading so a future operator who deliberately
-    omits a route from the map gets ``$0`` rather than silent default
-    pricing from LiteLLM's built-in cost map.
+    Models without verified shadow prices retain no explicit cost metadata.
     """
     pricing = _SUBSCRIPTION_SHADOW_PRICING.get(route["model_name"])
     if pricing is None:
@@ -820,52 +894,49 @@ _SUBSCRIPTION_ROUTES: dict[str, list[dict[str, Any]]] = {
         # short-circuits before the custom_llm_provider check) and forwards
         # to api.openai.com regardless of provider. The codex_chatgpt
         # handler strips the ``oauth-`` prefix before sending the model
-        # name upstream, so chatgpt.com still receives ``gpt-5.5``.
-        # gpt-5.6-{sol,terra,luna} — GPT-5.6-family frontier checkpoints served
-        # on the ChatGPT subscription (all three verified 2026-07-13). Reasoning
-        # models; the codex handler applies the default effort (medium) — no
-        # output cap, the Codex backend rejects max_output_tokens.
+        # name upstream. Current models and retained GPT-5.6 overrides:
+        # https://learn.chatgpt.com/docs/models (2026-10-14).
+        {
+            "model_name": "auth/gpt-6-astra",
+            "litellm_params": {
+                "model": "codex-oauth/oauth-gpt-6-astra",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        },
+        {
+            "model_name": "auth/gpt-6.1-sol",
+            "litellm_params": {
+                "model": "codex-oauth/oauth-gpt-6.1-sol",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        },
+        {
+            "model_name": "auth/gpt-6-luna",
+            "litellm_params": {
+                "model": "codex-oauth/oauth-gpt-6-luna",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        },
         {
             "model_name": "auth/gpt-5.6-sol",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.6-sol"},
+            "litellm_params": {
+                "model": "codex-oauth/oauth-gpt-5.6-sol",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
         },
         {
             "model_name": "auth/gpt-5.6-terra",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.6-terra"},
+            "litellm_params": {
+                "model": "codex-oauth/oauth-gpt-5.6-terra",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
         },
         {
             "model_name": "auth/gpt-5.6-luna",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.6-luna"},
-        },
-        {
-            "model_name": "auth/gpt-5.5",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.5"},
-        },
-        {
-            "model_name": "auth/gpt-5.4",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.4"},
-        },
-        {
-            "model_name": "auth/gpt-5.4-mini",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.4-mini"},
-        },
-        # Code-heavy override (option α). gpt-5.3-codex is OpenAI's
-        # agentic-coding specialized model (Codex + GPT-5 training
-        # stack); register the route here so per-agent env overrides
-        # like ``DECEPTICON_MODEL_PATCHER=auth/gpt-5.3-codex`` work
-        # without yaml edits. Slug ``gpt-5.3-codex`` IS in
-        # open_ai_chat_completion_models, so the sentinel is required.
-        {
-            "model_name": "auth/gpt-5.3-codex",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.3-codex"},
-        },
-        # gpt-5.3-codex-spark is the agentic-coding model the Codex SUBSCRIPTION
-        # actually exposes (chatgpt.com/backend-api/codex/models, verified
-        # 2026-06-25), vs the plain gpt-5.3-codex API slug. Register it so the
-        # subscription (auth) path can route the model it really serves.
-        {
-            "model_name": "auth/gpt-5.3-codex-spark",
-            "litellm_params": {"model": "codex-oauth/oauth-gpt-5.3-codex-spark"},
+            "litellm_params": {
+                "model": "codex-oauth/oauth-gpt-5.6-luna",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
         },
     ],
     "DECEPTICON_AUTH_GEMINI": [
@@ -939,8 +1010,8 @@ _SUBSCRIPTION_ROUTES: dict[str, list[dict[str, Any]]] = {
 # Fallback entries for subscription routes — appended to litellm_settings.fallbacks
 _SUBSCRIPTION_FALLBACKS: dict[str, list[dict[str, list[str]]]] = {
     "DECEPTICON_AUTH_CHATGPT": [
-        {"auth/gpt-5.5": ["auth/gpt-5.4"]},
-        {"auth/gpt-5.4": ["auth/gpt-5.4-mini"]},
+        {"auth/gpt-6-astra": ["auth/gpt-6.1-sol"]},
+        {"auth/gpt-6.1-sol": ["auth/gpt-6-luna"]},
     ],
     "DECEPTICON_AUTH_GEMINI": [
         {"gemini-sub/gemini-2.5-pro": ["gemini-sub/gemini-2.5-flash"]},
@@ -1026,6 +1097,11 @@ def merge_dynamic_models(
 
     model_list = list(merged.get("model_list") or [])
     existing = {entry.get("model_name") for entry in model_list if isinstance(entry, dict)}
+
+    for route in current_model_routes(env):
+        if route["model_name"] not in existing:
+            model_list.append(route)
+            existing.add(route["model_name"])
 
     for model_name in sorted(collect_requested_models(env)):
         if model_name in existing:

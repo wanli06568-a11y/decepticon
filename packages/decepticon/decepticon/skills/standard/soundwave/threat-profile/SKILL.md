@@ -3,6 +3,8 @@ name: threat-profile
 description: "Threat actor profiling for adversary emulation — APT group research, sophistication tiers, MITRE ATT&CK mapping, initial access vectors, custom archetypes."
 allowed-tools: Read Write Edit
 metadata:
+  skillogy:
+    version: 1
   subdomain: planning
   when_to_use: "threat modeling, adversary emulation, APT simulation, threat actor selection, who should we emulate, what kind of attacker"
   tags: threat-modeling, apt, adversary-emulation, mitre-attack
@@ -23,7 +25,8 @@ Threat profiling defines **who** the red team is emulating. Without a clear prof
 
 ### Step 1: Determine Tier
 
-Ask the user which tier fits. If they're unsure, recommend based on engagement type:
+Use the confirmed tier when available. If the requested profile needs a tier
+decision, use this table to explain the options:
 
 | Tier | Actor Type | Sophistication | Best For |
 |------|-----------|---------------|----------|
@@ -56,7 +59,7 @@ The profile must be consistent with what the RoE allows. There's no point emulat
 
 ### Step 4: Output
 
-Generate **two** payloads:
+When authoring a threat profile, these are the two compatible representations:
 
 **(a) Standalone `plan/threat-profile.json`** — full `ThreatProfile` schema:
 
@@ -84,8 +87,8 @@ Generate **two** payloads:
 
 ### Step 5: Named-actor kill chain (optional but recommended)
 
-When the operator picked a known actor, don't hand-build the TTP sequence — load the
-emulation catalog and copy the per-actor plan:
+When specialist detail about a named actor is useful, load the emulation catalog
+and relevant playbook:
 
 ```text
 load_skill("/skills/standard/soundwave/threat-profile/emulation/SKILL.md")   # routing table
@@ -97,3 +100,25 @@ ordered `kill_chain` to copy into `conops.json` (mapped to the 5 `ObjectivePhase
 and (c) the actor-specific RoE/safety gates to carry into `abort.json` + `deconfliction.json`.
 Prune any technique the RoE forbids (Step 3) before writing. Available: `apt29`, `sandworm`,
 `scattered-spider`, `volt-typhoon`, `lazarus`, `fin7`, `lockbit`.
+
+## Document schema (derived from the validator's model)
+
+`plan/threat-profile.json` must validate against `ThreatProfile`. Fields not listed here are not part of the model and are ignored by the validator.
+
+| field | type | required | allowed values / nested keys |
+| --- | --- | --- | --- |
+| `engagement_name` | str | yes |  |
+| `actor_name` | str | yes |  |
+| `actor_aliases` | list[str] | no |  |
+| `group_id` | str | no |  |
+| `tier` | ThreatTier | yes | one of `tier-1`, `tier-2`, `tier-3`, `tier-4` |
+| `sophistication` | str | yes |  |
+| `motivation` | str | yes |  |
+| `initial_access` | list[str] | no |  |
+| `key_ttps` | list[str] | no |  |
+| `tools` | list[str] | no |  |
+| `infrastructure` | list[str] | no |  |
+| `recent_cti_delta` | str | no |  |
+| `confidence` | FindingConfidence | no | one of `verified`, `probable`, `unverified` |
+| `version` | str | no |  |
+| `last_updated` | str | no |  |

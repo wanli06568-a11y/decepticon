@@ -1,6 +1,6 @@
 """Bash tool for the Decepticon agent.
 
-Thin wrapper around HTTPSandbox.execute_tmux(). All tmux session
+Thin wrapper around HTTPTransportSandbox.execute_tmux(). All tmux session
 management and PS1 polling logic lives in decepticon/sandbox_kernel/
 (tmux.py + base.py), shared with the in-container daemon.
 
@@ -45,14 +45,14 @@ log = logging.getLogger("decepticon.tools.bash.bash")
 # Sandbox lookup is a two-level chain:
 #   1. ``_sandbox_var`` — per-context override. Honoured first so a
 #      request-scoped middleware (multi-tenant) can pin a
-#      different HTTPSandbox for the lifetime of a request without
+#      different HTTPTransportSandbox for the lifetime of a request without
 #      touching the module-level default.
 #   2. ``_sandbox_default`` — module-level fallback. Required because
 #      Python ``contextvars`` do not propagate across thread boundaries,
 #      and LangGraph platform dispatches sub-agent tool nodes in a
 #      ThreadPoolExecutor whose workers inherit an empty context. Before
 #      this fallback existed, every sub-agent ``bash()`` call raised
-#      ``RuntimeError: HTTPSandbox not initialized`` even though
+#      ``RuntimeError: HTTPTransportSandbox not initialized`` even though
 #      ``set_sandbox`` ran at agent-factory build time in the main
 #      thread. Restoring the cross-thread default keeps the public
 #      ContextVar API (used for per-request overrides) intact.
@@ -242,7 +242,7 @@ def _sanitize_output(text: str) -> str:
 def set_sandbox(
     sandbox: BashSandboxProtocol,
 ) -> contextvars.Token[BashSandboxProtocol | None]:
-    """Inject the shared HTTPSandbox instance.
+    """Inject the shared HTTPTransportSandbox instance.
 
     Writes both:
       * ``_sandbox_var`` — the per-context value, returned token can be
@@ -272,9 +272,17 @@ def _sandbox_from_config(config: RunnableConfig | None) -> BashSandboxProtocol |
     Returns ``None`` when the config carries no sandbox endpoint (single-tenant
     / dev / OSS self-host), so the caller falls back to the process default.
     """
+    if os.environ.get("DECEPTICON_SANDBOX_PROVIDER", "").strip() == "openshell":
+        from decepticon.backends.factory import build_sandbox_backend
+
+        return build_sandbox_backend(config)
     configurable = (config or {}).get("configurable", {})
     if not isinstance(configurable, dict):
         return None
+    if configurable.get("sandbox_provider") == "openshell":
+        from decepticon.backends.factory import build_sandbox_backend
+
+        return build_sandbox_backend(config)
     url = configurable.get("sandbox_url")
     if not isinstance(url, str) or not url:
         return None
@@ -285,7 +293,7 @@ def _sandbox_from_config(config: RunnableConfig | None) -> BashSandboxProtocol |
 
 
 def get_sandbox(config: RunnableConfig | None = None) -> BashSandboxProtocol | None:
-    """Return the HTTPSandbox for this call.
+    """Return the HTTPTransportSandbox for this call.
 
     Resolution order:
       1. the run's per-engagement config (``configurable.sandbox_url``) — so a
@@ -447,7 +455,7 @@ async def bash(
     background: bool = False,
     *,
     description: str,
-    config: RunnableConfig | None = None,
+    config: RunnableConfig,
 ) -> str:
     """Execute a bash command in a persistent tmux session inside the Docker sandbox.
 
@@ -470,7 +478,7 @@ async def bash(
     """
     _sandbox = get_sandbox(config)
     if _sandbox is None:
-        raise RuntimeError("HTTPSandbox not initialized. Call set_sandbox() first.")
+        raise RuntimeError("HTTPTransportSandbox not initialized. Call set_sandbox() first.")
 
     workspace_path = _workspace_path_from_config(config)
     # Best-effort TTL prune of <engagement>/.scratch/ (throttled internally)
@@ -542,7 +550,7 @@ async def bash(
 
 
 @tool
-async def bash_output(session: str = "main", config: RunnableConfig | None = None) -> str:
+async def bash_output(session: str = "main", *, config: RunnableConfig) -> str:
     """Retrieve new output from a sandbox session since the last call.
 
     WHEN TO USE:
@@ -561,7 +569,7 @@ async def bash_output(session: str = "main", config: RunnableConfig | None = Non
     """
     _sandbox = get_sandbox(config)
     if _sandbox is None:
-        raise RuntimeError("HTTPSandbox not initialized.")
+        raise RuntimeError("HTTPTransportSandbox not initialized.")
 
     workspace_path = _workspace_path_from_config(config)
 
@@ -615,7 +623,7 @@ async def bash_output(session: str = "main", config: RunnableConfig | None = Non
 
 
 @tool
-async def bash_kill(session: str, config: RunnableConfig | None = None) -> str:
+async def bash_kill(session: str, *, config: RunnableConfig) -> str:
     """Forcefully terminate a sandbox session.
 
     Sends Ctrl+C, kills the tmux session, and clears local job tracking.
@@ -626,7 +634,7 @@ async def bash_kill(session: str, config: RunnableConfig | None = None) -> str:
     """
     _sandbox = get_sandbox(config)
     if _sandbox is None:
-        raise RuntimeError("HTTPSandbox not initialized.")
+        raise RuntimeError("HTTPTransportSandbox not initialized.")
 
     workspace_path = _workspace_path_from_config(config)
 
@@ -646,7 +654,7 @@ async def bash_kill(session: str, config: RunnableConfig | None = None) -> str:
 
 
 @tool
-async def bash_status(config: RunnableConfig | None = None) -> str:
+async def bash_status(*, config: RunnableConfig) -> str:
     """List all known sandbox sessions with running and completed jobs.
 
     Use before launching a new background job to spot conflicts, or to
@@ -654,7 +662,7 @@ async def bash_status(config: RunnableConfig | None = None) -> str:
     """
     _sandbox = get_sandbox(config)
     if _sandbox is None:
-        raise RuntimeError("HTTPSandbox not initialized.")
+        raise RuntimeError("HTTPTransportSandbox not initialized.")
 
     workspace_path = _workspace_path_from_config(config)
 

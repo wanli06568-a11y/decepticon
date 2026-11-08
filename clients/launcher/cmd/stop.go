@@ -1,15 +1,21 @@
 package cmd
 
 import (
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/cmd/opscontrol"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/compose"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/ui"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/cmd/infracontrol"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/compose"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/ui"
 	"github.com/spf13/cobra"
 )
 
 var stopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop all Decepticon services",
+	Long: `Stop every Decepticon service, including the opscontrol daemon.
+
+Stops and removes all Compose containers across every workload
+profile, then tears down the opscontrol daemon. Conversations and
+workspace data are kept; only the running services are stopped.`,
+	Example: `  decepticon stop    Stop all Decepticon services and the daemon`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c := compose.New()
 		ui.Info("Stopping Decepticon services...")
@@ -20,11 +26,11 @@ var stopCmd = &cobra.Command{
 		if err := c.Down(); err != nil {
 			return err
 		}
-		// Tear down the opscontrol daemon after compose so any
+		// Tear down the infracontrol daemon after compose so any
 		// workload it owned has already been removed by `compose down`.
 		// Non-fatal: a never-started daemon is a no-op here.
-		if err := opscontrol.Stop(); err != nil {
-			ui.Warning("opscontrol stop: " + err.Error())
+		if err := infracontrol.Stop(); err != nil {
+			ui.Warning("infracontrol stop: " + err.Error())
 		}
 		ui.Success("All services stopped")
 		return nil

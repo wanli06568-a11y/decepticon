@@ -8,8 +8,8 @@
 The sandbox is the part of the stack that actually touches targets. It
 runs root (because raw sockets require it) inside a container with the
 minimum capabilities the offensive toolset needs, with `no-new-privileges`,
-a 4 GB memory cap, a 1024-pid cap, and `cap_drop: ALL` then explicit
-`cap_add` for the seven caps the agent actually uses.
+a 4 GiB memory cap, a 4096-pid cap, and `cap_drop: ALL` then explicit
+`cap_add` for the ten capabilities listed in the current Compose service.
 
 The current OSS deployment runs **one shared sandbox container per
 host**. The launcher swaps the `/workspace` bind-mount per engagement,
@@ -24,7 +24,6 @@ sandbox:
   cap_drop: [ALL]
   cap_add:
     - NET_RAW          # nmap SYN scans
-    - NET_ADMIN        # raw routing
     - NET_BIND_SERVICE # low ports
     - SYS_PTRACE       # frida / gdb (Reverser)
     - SETUID
@@ -36,15 +35,15 @@ sandbox:
   security_opt:
     - no-new-privileges:true
   mem_limit: 4g
-  pids_limit: 1024
+  pids_limit: 4096
   volumes:
     - ${DECEPTICON_ENGAGEMENT_WORKSPACE:-${DECEPTICON_HOME:-~/.decepticon}/workspace}:/workspace
 ```
 
 What this gets right:
 
-- **Capability surface is small.** A container compromise gives root-
-  with-7-caps, not root-with-37-caps.
+- **Capability surface is small.** A container compromise gives root
+  with the ten explicitly added capabilities, not every host capability.
 - **No-new-privileges** blocks setuid binaries from escalating *within*
   the container.
 - **Memory cap** stops a fuzzer or runaway scan from OOM-killing the
@@ -65,7 +64,12 @@ What's still wrong:
   `loud`, the tmux history that recorded that transition is visible to
   B's tmux history command.
 
-## Target: per-engagement sandbox containers
+## Proposed target: per-engagement sandbox containers
+
+The following sketch is not an implemented launcher contract. In particular,
+`DECEPTICON_PER_ENGAGEMENT_SANDBOX` and `DECEPTICON_SANDBOX_RUNTIME` are design
+ideas, not supported configuration flags in current main. The process limit in
+the historical sketch is not the current Compose value.
 
 The launcher already chooses the engagement, sets
 `DECEPTICON_ENGAGEMENT_WORKSPACE`, and runs `docker compose up`. The
@@ -146,7 +150,7 @@ func (l *Lifecycle) Acquire(slug string) (*Handle, error) {
             "--name", name,
             "--network", netName,
             "--cap-drop=ALL",
-            "--cap-add=NET_RAW", "--cap-add=NET_ADMIN",
+            "--cap-add=NET_RAW",
             "--cap-add=NET_BIND_SERVICE", "--cap-add=SYS_PTRACE",
             "--cap-add=SETUID", "--cap-add=SETGID",
             "--cap-add=CHOWN", "--cap-add=DAC_OVERRIDE",
@@ -197,8 +201,9 @@ Firecracker microVMs would replace Docker containers with hardware-
 virtualized VMs (separate kernel per VM, ~125ms boot). That's the right
 architecture for multi-tenant deployments where a sandbox-kernel-exploit-to-host
 escape is in the threat model. For OSS / single-operator deployments
-the Docker container boundary is sufficient and Firecracker requires
-KVM (no macOS, no Windows desktop). Multi-tenant deployers should run Firecracker.
+this document does not establish that the Docker boundary is sufficient for
+every threat model. Firecracker requires
+KVM (no macOS, no Windows desktop). Multi-tenant deployments need separately qualified isolation.
 
 gVisor is the middle ground: same Docker UX, intercepts every syscall
 through a user-space kernel. ~20-30% perf cost. Available as a Docker
@@ -222,7 +227,7 @@ docker inspect decepticon-sandbox --format '{{.HostConfig.Memory}}'
 
 # Verify pids_limit
 docker inspect decepticon-sandbox --format '{{.HostConfig.PidsLimit}}'
-# Expect: 1024
+# Expect: 4096
 ```
 
 ## Future hardening

@@ -7,16 +7,21 @@ import logging
 import posixpath
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import partial
 from typing import Annotated, Any
 from uuid import uuid4
 
 from deepagents.backends.protocol import BackendProtocol
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
+from langchain_core.utils.json_schema import dereference_refs
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
+from pydantic import ValidationError, WithJsonSchema
 
+from decepticon.middleware.workflow_opplan import validate_workflow_plan
 from decepticon.tools.opplan_graph import PlanInspection, inspect_plan, unmet_prerequisites
+from decepticon.workflows import WorkflowError, WorkflowSnapshot
 from decepticon_core.types.attack_catalog import canonical_attack_annotation
 from decepticon_core.types.engagement import (
     OPPLAN,
@@ -34,6 +39,30 @@ _run_sandbox_backend: ContextVar[BackendProtocol | None] = ContextVar(
 OPPLAN_FILE_SCHEMA_VERSION = "2"
 OPPLAN_VIRTUAL_PATH = "/workspace/plan/opplan.json"
 _UNSET = object()
+
+
+def _objective_submission_schema() -> dict[str, Any]:
+    """Publish the canonical objective contract, including new-node references.
+
+    Runtime validation stays after server-issued IDs/reference resolution, so
+    existing callers retain structured tool errors rather than graph failures.
+    """
+    schema = dereference_refs(Objective.model_json_schema())
+    schema.pop("$defs", None)
+    schema["required"] = [name for name in schema["required"] if name != "id"]
+    reference = {"anyOf": [{"type": "string"}, {"type": "integer", "minimum": 0}]}
+    schema["properties"]["blocked_by"]["items"] = reference
+    schema["properties"]["any_of"]["items"]["items"] = reference
+    schema["properties"]["parent_id"]["anyOf"] = [*reference["anyOf"], {"type": "null"}]
+    schema["description"] = (
+        "An OPPLAN objective. Omit id for a new node. phase uses its enum values; "
+        "priority is an integer (1 = highest), never a severity label. Dependencies "
+        "can reference existing IDs or zero-based new-node positions."
+    )
+    return schema
+
+
+ObjectivePayload = Annotated[dict[str, Any], WithJsonSchema(_objective_submission_schema())]
 
 # All OPPLAN tools — used by ``OPPLANMiddleware.after_model`` to enforce
 # strictly sequential calls (one OPPLAN tool per LLM step). Parallel calls
@@ -286,7 +315,7 @@ def _live_sandbox_backend(fallback: BackendProtocol | None) -> BackendProtocol |
     # (the multi-tenant orchestrator path this exists for). Off that path — unit
     # tests, build-time construction, single-tenant/env deploys — there is no
     # per-run sandbox to reach, and ``build_sandbox_backend()`` does NOT raise:
-    # it returns an HTTPSandbox for the default ``http://localhost:9999``. Writing
+    # it returns an HTTPTransportSandbox for the default ``http://localhost:9999``. Writing
     # OPPLAN through that dead endpoint hangs (the persist test hung the whole
     # middleware suite → CI 30-min timeout). The captured ``fallback`` already
     # points at the right backend for those cases, so use it.
@@ -593,11 +622,12 @@ def build_opplan_tools(backend: BackendProtocol | None = None) -> list:
             "in objectives from blocked_by, any_of, parent_id, or a fact producer_id. "
             "Existing nodes retain their IDs. expected_revision must match the "
             "current plan. Running and terminal objectives cannot be rewritten or removed. "
+            "Set workflow_stage on each leaf to its pinned WORKFLOW stage ID. "
             "Use this to create or replan a DAG, then dispatch only ready objectives."
         )
     )
     def commit_opplan(
-        objectives: list[dict[str, Any]],
+        objectives: list[ObjectivePayload],
         expected_revision: int,
         state: Annotated[dict, InjectedState],
         facts: list[dict[str, Any]] | None = None,
@@ -628,6 +658,19 @@ def build_opplan_tools(backend: BackendProtocol | None = None) -> list:
             return _graph_rejection(inspection, tool_call_id)
         if not proposed:
             return _tool_error(tool_call_id, "OPPLAN must contain at least one objective.")
+        pin = state.get("workflow_snapshot")
+        if pin is not None:
+            try:
+                workflow_error = validate_workflow_plan(
+                    WorkflowSnapshot.model_validate_json(pin),
+                    proposed,
+                    partial(_evidence_error, backend, state.get("workspace_path")),
+                    facts=proposed_facts,
+                )
+            except (ValidationError, WorkflowError) as exc:
+                return _tool_error(tool_call_id, f"Invalid workflow: {exc}")
+            if workflow_error:
+                return _tool_error(tool_call_id, workflow_error)
         new = {objective.id: objective for objective in proposed}
         for objective_id, objective in old.items():
             if objective_id in new and new[objective_id].status != objective.status:
@@ -1260,6 +1303,20 @@ def build_opplan_tools(backend: BackendProtocol | None = None) -> list:
         inspection = _inspect_objective_rows(objectives, state.get("plan_facts", []))
         if inspection.issues:
             return _graph_rejection(inspection, tool_call_id)
+
+        pin = state.get("workflow_snapshot")
+        if pin is not None:
+            try:
+                workflow_error = validate_workflow_plan(
+                    WorkflowSnapshot.model_validate_json(pin),
+                    [Objective.model_validate(row) for row in objectives],
+                    partial(_evidence_error, backend, state.get("workspace_path")),
+                    facts=[PlanFact.model_validate(row) for row in state.get("plan_facts", [])],
+                )
+            except (ValidationError, WorkflowError) as exc:
+                return _tool_error(tool_call_id, f"Invalid workflow: {exc}")
+            if workflow_error:
+                return _tool_error(tool_call_id, workflow_error)
 
         if not updated_fields:
             return Command(

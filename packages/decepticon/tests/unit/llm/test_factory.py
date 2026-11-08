@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_openai import ChatOpenAI
 
 from decepticon.llm.factory import (
     LLM_MAX_TOKENS_ENV,
@@ -25,6 +26,7 @@ from decepticon_core.types.llm import (
     AuthMethod,
     Credentials,
     LLMModelMapping,
+    ModelAssignment,
     ModelProfile,
     ProxyConfig,
 )
@@ -178,8 +180,73 @@ class TestMaxTokensResolution:
         assert _model_max_output_tokens("auth/claude-opus-4-8") == 128000
         assert _model_max_output_tokens("openrouter/anthropic/claude-sonnet-4-6") == 128000
 
+    @pytest.mark.parametrize("family", ["opus", "sonnet"])
+    @pytest.mark.parametrize(
+        "route",
+        [
+            "anthropic/claude-{family}-4-5",
+            "auth/claude-{family}-4-5",
+            "openrouter/anthropic/claude-{family}-4.5",
+            "anthropic/claude-{family}-4-5-20251101",
+            "vertex_ai/claude-{family}-4-5@20251101",
+            "bedrock/us.anthropic.claude-{family}-4-5-20251101-v1:0",
+        ],
+    )
+    def test_legacy_45_ceiling_across_routes(self, family, route) -> None:
+        assert _model_max_output_tokens(route.format(family=family)) == 64000
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "anthropic/claude-opus-4-6",
+            "openrouter/anthropic/claude-opus-4.7",
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-opus-5",
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-sonnet-5",
+            "vercel/anthropic/claude-sonnet-5.5",
+            "anthropic/claude-fable-5",
+            "anthropic/claude-fable-5-1",
+            "anthropic/claude-haiku-5-5",
+            "auth/claude-haiku-5.5",
+            "openai/gpt-6.1-sol",
+        ],
+    )
+    def test_supported_high_output_models_keep_128k(self, model_id) -> None:
+        assert _model_max_output_tokens(model_id) == 128000
+
+    @pytest.mark.parametrize(
+        "model_id", ["custom/my-opus", "custom/claude-opus-99", "custom/claude-opus-4-50"]
+    )
+    def test_unrecognized_names_do_not_inherit_family_ceiling(self, model_id) -> None:
+        assert _model_max_output_tokens(model_id) == 64000
+
     def test_haiku_gets_64k(self) -> None:
         assert _model_max_output_tokens("anthropic/claude-haiku-4-5") == 64000
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "nvidia_nim/nvidia/llama-3.1-nemotron-70b-instruct",
+            "hf/nvidia/Llama-3.1-Nemotron-70B-Instruct-HF",
+            "gateway/nvidia/Llama-3.1-Nemotron-70B-Instruct",
+        ],
+    )
+    def test_publisher_limit_follows_exact_model_across_hosts(self, model_id, monkeypatch):
+        monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
+        assert _resolve_max_tokens(model_id) == 4000
+        monkeypatch.setenv(LLM_MAX_TOKENS_ENV, "8192")
+        assert _resolve_max_tokens(model_id) == 8192
+
+    @pytest.mark.parametrize(("host_limit", "expected"), [(2048, 2048), (8192, 4000)])
+    def test_host_request_limit_does_not_replace_publisher_spec(
+        self, monkeypatch, host_limit, expected
+    ) -> None:
+        from decepticon.llm.model_contracts import ROUTE_OUTPUT_DEFAULTS
+
+        route = "gateway/nvidia/Llama-3.1-Nemotron-70B-Instruct"
+        monkeypatch.setitem(ROUTE_OUTPUT_DEFAULTS, route.lower(), host_limit)
+        assert _model_max_output_tokens(route) == expected
 
     def test_unknown_model_falls_back_to_safe_default(self) -> None:
         assert _model_max_output_tokens("openai/gpt-5-nano") == 64000
@@ -197,6 +264,14 @@ class TestMaxTokensResolution:
         monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
         assert _resolve_max_tokens("anthropic/claude-haiku-4-5") == 64000
 
+    @pytest.mark.parametrize("region", ["", "us.", "eu.", "apac.", "global."])
+    def test_bedrock_limit_does_not_leak_into_other_providers(self, region) -> None:
+        assert _resolve_max_tokens(f"bedrock/{region}anthropic.claude-sonnet-4-6") == 64000
+        assert _resolve_max_tokens("anthropic/claude-sonnet-4-6") == 128000
+        assert _resolve_max_tokens("openrouter/anthropic/claude-sonnet-4.6") == 128000
+        assert _resolve_max_tokens("bedrock/anthropic.claude-opus-4-7") == 128000
+        assert _resolve_max_tokens("openai/qwen-plus") == 64000
+
 
 class TestLLMFactory:
     def setup_method(self):
@@ -206,6 +281,137 @@ class TestLLMFactory:
         self.mapping = LLMModelMapping.from_credentials_and_profile(creds, ModelProfile.ECO)
         self.factory = LLMFactory(self.proxy, self.mapping)
 
+    @pytest.mark.parametrize("provider", ["ollama_chat", "lm_studio", "llamacpp", "custom"])
+    @pytest.mark.parametrize("override", [None, "8192", "192000", "bad", "0", "-1"])
+    def test_runtime_defined_models_omit_unknown_output_cap(self, monkeypatch, provider, override):
+        if override is None:
+            monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
+        else:
+            monkeypatch.setenv(LLM_MAX_TOKENS_ENV, override)
+        model_id = f"{provider}/my-small-model"
+        client = self.factory._create_chat_model(model_id, 0.2)
+        assert isinstance(client, ChatOpenAI)
+        payload = client._get_request_payload("hello")
+        cap = payload.get("max_completion_tokens", payload.get("max_tokens"))
+        if override in {"8192", "192000"}:
+            assert cap == int(override)
+        else:
+            assert "max_tokens" not in payload
+            assert "max_completion_tokens" not in payload
+        assert payload["model"] == model_id
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("anthropic/claude-opus-4-5", 64000),
+            ("auth/claude-opus-4-5", 64000),
+            ("openrouter/anthropic/claude-sonnet-4.5", 64000),
+            ("anthropic/claude-opus-4-6", 128000),
+            ("anthropic/claude-haiku-5-5", 128000),
+        ],
+    )
+    @pytest.mark.parametrize("override", [None, "8192", "192000", "bad", "0", "-1"])
+    def test_created_client_and_payload_respect_model_limit(
+        self, monkeypatch, model_id, expected, override
+    ) -> None:
+        if override is None:
+            monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
+        else:
+            monkeypatch.setenv(LLM_MAX_TOKENS_ENV, override)
+        if override in {"8192", "192000"}:
+            expected = int(override)
+        model = self.factory._create_chat_model(model_id, 0.2)
+        assert isinstance(model, ChatOpenAI)
+        payload = model._get_request_payload("check output settings")
+        assert model.max_tokens == expected
+        assert payload.get("max_completion_tokens", payload.get("max_tokens")) == expected
+        assert payload["model"] == model_id
+
+    @pytest.mark.parametrize(
+        ("model_id", "limit"),
+        [
+            ("anthropic/claude-opus-4-5", 64000),
+            ("anthropic/claude-sonnet-4-5", 64000),
+            ("bedrock/anthropic.claude-sonnet-4-6", 64000),
+            ("cerebras/qwen-3.8-27b", 32768),
+            ("cerebras/gpt-oss-120b", 32768),
+            ("groq/llama-3.3-70b-versatile", 32768),
+            ("dashscope/qwen-plus", 16384),
+            ("dashscope/qwen-max", 8192),
+            ("dashscope/qwen-turbo", 16384),
+            ("qianfan/ernie-4.5-turbo-128k", 12288),
+            ("qianfan/ernie-4.5-turbo-32k", 12288),
+            ("qianfan/ernie-speed-pro-128k", 4096),
+            ("cohere_chat/command-a-03-2025", 8000),
+            ("cohere_chat/command-r", 4000),
+            ("cohere_chat/command-r-plus", 4000),
+            ("zenmux/anthropic/claude-sonnet-4.6", 64000),
+            ("venice/claude-sonnet-4-6", 64000),
+            ("venice/deepseek-v4-flash", 32768),
+            ("nvidia_nim/nvidia/llama-3.1-nemotron-70b-instruct", 4000),
+        ],
+    )
+    def test_legacy_model_request_passes_strict_proxy_limit(
+        self, monkeypatch, model_id, limit
+    ) -> None:
+        """Exercise the actual HTTP body; no provider credentials/inference."""
+        requests: list[dict] = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(payload)
+                cap = payload.get("max_completion_tokens", payload.get("max_tokens"))
+                valid = isinstance(cap, int) and 0 < cap <= limit
+                body = (
+                    {
+                        "id": "cap-check",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "cap-ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    if valid
+                    else {
+                        "error": {
+                            "message": "output cap exceeds model limit",
+                            "type": "invalid_request_error",
+                        }
+                    }
+                )
+                response = json.dumps(body).encode()
+                self.send_response(200 if valid else 400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
+        monkeypatch.setenv("DECEPTICON_LLM_DISABLE_STREAMING", "true")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            proxy = ProxyConfig(
+                url=f"http://127.0.0.1:{server.server_port}/v1", api_key="test-key", max_retries=0
+            )
+            model = LLMFactory(proxy, self.mapping)._create_chat_model(model_id, 0.2)
+            assert model.invoke([HumanMessage(content="check output settings")]).content == "cap-ok"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        assert len(requests) == 1
+
     def test_ollama_keeps_text_streaming_but_buffers_tool_calls(self, monkeypatch) -> None:
         monkeypatch.delenv("DECEPTICON_LLM_DISABLE_STREAMING", raising=False)
 
@@ -213,6 +419,22 @@ class TestLLMFactory:
 
         assert model.streaming is True
         assert model.disable_streaming == "tool_calling"
+
+        text_payload = model._get_request_payload("hello")
+        assert text_payload["stream"] is True
+        tool_payload = model._get_request_payload(
+            "hello",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "read_status", "parameters": {"type": "object"}},
+                }
+            ],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        assert tool_payload["stream"] is False
+        assert "stream_options" not in tool_payload
 
     def test_gpt6_agent_calls_use_responses_api(self) -> None:
         for model_id in (
@@ -243,6 +465,9 @@ class TestLLMFactory:
             "anthropic/claude-fable-5-1",
             "anthropic/claude-opus-5-5",
             "anthropic/claude-sonnet-5-5",
+            "anthropic/claude-haiku-5-5",
+            "openrouter/anthropic/claude-haiku-5.5",
+            "vercel/anthropic/claude-sonnet-5.5",
         ],
     )
     def test_claude_tool_turn_preserves_thinking_blocks(self, monkeypatch, model_id) -> None:
@@ -421,6 +646,112 @@ class TestLLMFactory:
     def test_factory_initializes(self):
         assert self.factory.proxy_url == "http://localhost:4000"
 
+    def test_google_new_project_defaults_preserve_legacy_and_subscription_ids(self) -> None:
+        mapping = LLMModelMapping.from_credentials_and_profile(
+            Credentials(methods=[AuthMethod.GOOGLE_API]), ModelProfile.ECO
+        )
+        factory = LLMFactory(self.proxy, mapping, apply_role_overrides=False)
+        recon = factory.get_model("recon")
+        orchestrator = factory.get_model("decepticon")
+        assert isinstance(recon, ChatOpenAI)
+        assert isinstance(orchestrator, ChatOpenAI)
+        assert recon.model_name == "gemini/gemini-3.5-flash-lite"
+        assert orchestrator.model_name == "gemini/gemini-3.8-flash"
+        explicit = LLMModelMapping(
+            assignments={"recon": ModelAssignment(primary="gemini/gemini-2.5-pro")}
+        )
+        legacy = LLMFactory(self.proxy, explicit, apply_role_overrides=False).get_model("recon")
+        assert isinstance(legacy, ChatOpenAI)
+        assert legacy.model_name == "gemini/gemini-2.5-pro"
+        subscription = LLMModelMapping.from_credentials_and_profile(
+            Credentials(methods=[AuthMethod.GOOGLE_OAUTH]), ModelProfile.ECO
+        )
+        assert subscription.get_assignment("decepticon").primary == "gemini-sub/gemini-2.5-pro"
+
+    def test_groq_automatic_chain_uses_current_models_but_keeps_explicit_legacy(self) -> None:
+        mapping = LLMModelMapping.from_credentials_and_profile(
+            Credentials(methods=[AuthMethod.GROQ_API]), ModelProfile.ECO
+        )
+        factory = LLMFactory(self.proxy, mapping, apply_role_overrides=False)
+        recon = factory.get_model("recon")
+        orchestrator = factory.get_model("decepticon")
+        assert isinstance(recon, ChatOpenAI)
+        assert isinstance(orchestrator, ChatOpenAI)
+        assert recon.model_name == "groq/openai/gpt-oss-20b"
+        assert orchestrator.model_name == "groq/openai/gpt-oss-120b"
+        explicit = LLMModelMapping(
+            assignments={"recon": ModelAssignment(primary="groq/llama-3.3-70b-versatile")}
+        )
+        legacy = LLMFactory(self.proxy, explicit, apply_role_overrides=False).get_model("recon")
+        assert isinstance(legacy, ChatOpenAI)
+        assert legacy.model_name == "groq/llama-3.3-70b-versatile"
+
+    @pytest.mark.parametrize("route", ["kilo/openai/gpt-5.4", "vercel/moonshotai/kimi-k3"])
+    def test_gateway_sampling_contract_is_applied_to_payload(self, route) -> None:
+        client = self.factory._create_chat_model(route, 0.2)
+        assert isinstance(client, ChatOpenAI)
+        payload = client._get_request_payload("check", top_p=0.9, top_k=5)
+        assert payload["model"] == route
+        assert not {"temperature", "top_p", "top_k"} & payload.keys()
+        extras = {"temperature": 0.2, "top_p": 0.9, "top_k": 5, "audit_extension": True}
+        extended = client._get_request_payload("check", extra_body=extras)
+        assert extended["extra_body"] == {"audit_extension": True}
+        assert extras["temperature"] == 0.2
+        assert extras["top_p"] == 0.9
+        assert extras["top_k"] == 5
+        # Other gateways/direct routes declare different sampling contracts.
+        other = self.factory._create_chat_model("vercel/openai/gpt-5.4", 0.2)
+        assert isinstance(other, ChatOpenAI)
+        assert other._get_request_payload("check")["temperature"] == 0.2
+
+    @pytest.mark.parametrize(
+        ("role_cap", "global_cap", "expected"),
+        [
+            (4096, None, [4096, 4096, 4096]),
+            (4096, "1024", [1024, 1024, 1024]),
+            (0, None, [32768, 16384, None]),
+            (-1, "bad", [32768, 16384, None]),
+        ],
+    )
+    def test_role_cap_reaches_primary_and_all_fallback_payloads(
+        self, monkeypatch, role_cap, global_cap, expected
+    ) -> None:
+        monkeypatch.delenv("DECEPTICON_DESKTOP_MODEL", raising=False)
+        monkeypatch.delenv("DECEPTICON_MODEL_RECON", raising=False)
+        monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
+        if global_cap is not None:
+            monkeypatch.setenv(LLM_MAX_TOKENS_ENV, global_cap)
+        mapping = LLMModelMapping(
+            assignments={
+                "recon": ModelAssignment(
+                    primary="cerebras/gpt-oss-120b",
+                    fallbacks=["dashscope/qwen-plus", "custom/small-model"],
+                    max_tokens=role_cap,
+                )
+            }
+        )
+        factory = LLMFactory(self.proxy, mapping)
+        clients = [factory.get_model("recon"), *factory.get_fallback_models("recon")]
+        for client, cap in zip(clients, expected, strict=True):
+            assert isinstance(client, ChatOpenAI)
+            payload = client._get_request_payload("check role cap")
+            assert payload.get("max_completion_tokens", payload.get("max_tokens")) == cap
+
+    @pytest.mark.parametrize("name", ["DECEPTICON_DESKTOP_MODEL", "DECEPTICON_MODEL_RECON"])
+    def test_model_override_preserves_role_cap(self, monkeypatch, name) -> None:
+        monkeypatch.delenv(LLM_MAX_TOKENS_ENV, raising=False)
+        monkeypatch.delenv("DECEPTICON_DESKTOP_MODEL", raising=False)
+        monkeypatch.delenv("DECEPTICON_MODEL_RECON", raising=False)
+        monkeypatch.setenv(name, "custom/small-model")
+        mapping = LLMModelMapping(
+            assignments={"recon": ModelAssignment(primary="openai/gpt-5-nano", max_tokens=2048)}
+        )
+        client = LLMFactory(self.proxy, mapping).get_model("recon")
+        assert isinstance(client, ChatOpenAI)
+        payload = client._get_request_payload("check role cap")
+        assert payload["model"] == "custom/small-model"
+        assert payload.get("max_completion_tokens", payload.get("max_tokens")) == 2048
+
     def test_get_model_returns_chat_model(self):
         model = self.factory.get_model("recon")
         assert model is not None
@@ -449,7 +780,7 @@ class TestLLMFactory:
         names = [m.model_name for m in models]
         assert names == [
             "openai/gpt-5-nano",
-            "gemini/gemini-2.5-flash-lite",
+            "gemini/gemini-3.5-flash-lite",
             "deepseek/deepseek-v4-flash",
             "openrouter/anthropic/claude-haiku-4-5",
             "nvidia_nim/meta/llama-3.2-3b-instruct",
@@ -460,7 +791,7 @@ class TestLLMFactory:
         names = [m.model_name for m in models]
         assert names == [
             "openai/gpt-5.5",
-            "gemini/gemini-2.5-pro",
+            "gemini/gemini-3.8-flash",
             "minimax/MiniMax-M3",
             "deepseek/deepseek-v4-pro",
             "xai/grok-4.3",
@@ -688,22 +1019,8 @@ class TestResolveCredentials:
         """When every detected method is a placeholder/missing, the resolver
         falls back to the all-API-methods inventory so module-level agent
         constructors stay importable in CI / dev shells without keys."""
+        _scrub_other_credentials(monkeypatch)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "your-anthropic-key-here")
-        for k in (
-            "OPENAI_API_KEY",
-            "GEMINI_API_KEY",
-            "MINIMAX_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "XAI_API_KEY",
-            "MISTRAL_API_KEY",
-            "OPENROUTER_API_KEY",
-            "NVIDIA_API_KEY",
-            "OLLAMA_API_BASE",
-            "OLLAMA_MODEL",
-        ):
-            monkeypatch.delenv(k, raising=False)
-        monkeypatch.delenv("DECEPTICON_AUTH_PRIORITY", raising=False)
-        monkeypatch.delenv("DECEPTICON_AUTH_CLAUDE_CODE", raising=False)
         creds = _resolve_credentials()
         assert creds.methods == [
             AuthMethod.ANTHROPIC_API,
@@ -799,22 +1116,7 @@ class TestResolveCredentials:
         so module imports work without keys present. Only **explicit**
         priority with no matches gets escalated to ERROR.
         """
-        for k in (
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GEMINI_API_KEY",
-            "MINIMAX_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "XAI_API_KEY",
-            "MISTRAL_API_KEY",
-            "OPENROUTER_API_KEY",
-            "NVIDIA_API_KEY",
-            "OLLAMA_API_BASE",
-            "OLLAMA_MODEL",
-        ):
-            monkeypatch.delenv(k, raising=False)
-        monkeypatch.delenv("DECEPTICON_AUTH_PRIORITY", raising=False)
-        monkeypatch.delenv("DECEPTICON_AUTH_CLAUDE_CODE", raising=False)
+        _scrub_other_credentials(monkeypatch)
 
         # Match the explicit-priority test's pattern so caplog sees the
         # records — the decepticon parent logger defaults to
@@ -916,7 +1218,11 @@ class TestTemperatureDrop:
     def test_current_claude_models_drop_temperature(self):
         assert self._drops("anthropic/claude-fable-5-1") is True
         assert self._drops("anthropic/claude-opus-5-5") is True
+        assert self._drops("anthropic/claude-sonnet-5") is True
         assert self._drops("anthropic/claude-sonnet-5-5") is True
+
+    def test_gpt_5_6_drops_temperature(self):
+        assert self._drops("openai/gpt-5.6-sol") is True
 
     def test_ollama_keeps_temperature(self):
         assert self._drops("ollama_chat/qwen3-coder:30b") is False
@@ -1739,3 +2045,54 @@ class TestLLMTimeout:
         with pytest.raises(ValueError, match="greater than 0"):
             asyncio.run(model.ainvoke("hi"))
         assert called is False, "upstream request coroutine must not be created on bad timeout"
+
+
+# ── Generic OpenAI-compatible gateway detection (#989) ──────────────────
+
+
+class TestOpenAICompatGatewayDetection:
+    def test_default_off(self, monkeypatch):
+        from decepticon.llm.factory import _openai_compat_gateway_configured
+
+        for var in (
+            "OPENAI_COMPAT_GATEWAY_API_BASE",
+            "OPENAI_COMPAT_GATEWAY_API_KEY",
+            "OPENAI_COMPAT_GATEWAY_MODEL",
+            "OPENAI_COMPAT_GATEWAY_MODEL_HIGH",
+            "OPENAI_COMPAT_GATEWAY_MODEL_MID",
+            "OPENAI_COMPAT_GATEWAY_MODEL_LOW",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        assert _openai_compat_gateway_configured() is False
+
+    def test_requires_base_key_and_model(self, monkeypatch):
+        from decepticon.llm.factory import _openai_compat_gateway_configured
+
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_BASE", "https://gateway.example.com/v1")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_KEY", "sk-compat-" + "a" * 24)
+        # model still missing
+        monkeypatch.delenv("OPENAI_COMPAT_GATEWAY_MODEL", raising=False)
+        monkeypatch.delenv("OPENAI_COMPAT_GATEWAY_MODEL_HIGH", raising=False)
+        assert _openai_compat_gateway_configured() is False
+
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL", "gpt-4o-mini")
+        assert _openai_compat_gateway_configured() is True
+
+    def test_placeholder_key_rejected(self, monkeypatch):
+        from decepticon.llm.factory import _openai_compat_gateway_configured
+
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_BASE", "https://gateway.example.com/v1")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_KEY", "your-openai-compat-gateway-key-here")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL", "gpt-4o-mini")
+        assert _openai_compat_gateway_configured() is False
+
+    def test_auth_inventory_opt_in(self, monkeypatch):
+        from decepticon.llm.factory import auth_inventory
+        from decepticon_core.types.llm import AuthMethod
+
+        monkeypatch.setenv("DECEPTICON_AUTH_PRIORITY", "openai_compat_gateway_api")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_BASE", "https://gateway.example.com/v1")
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_API_KEY", "sk-compat-" + "a" * 24)
+        monkeypatch.setenv("OPENAI_COMPAT_GATEWAY_MODEL", "gpt-4o-mini")
+        inv = auth_inventory()
+        assert inv.resolved_chain == (AuthMethod.OPENAI_COMPAT_GATEWAY_API,)

@@ -16,14 +16,14 @@
 
 <br/>
 
-<a href="https://github.com/PurpleAILAB/Decepticon/blob/main/LICENSE">
-  <img src="https://img.shields.io/github/license/PurpleAILAB/Decepticon?style=for-the-badge&color=blue" alt="License: Apache 2.0">
+<a href="https://github.com/BitterSecurity/Decepticon/blob/main/LICENSE">
+  <img src="https://img.shields.io/github/license/BitterSecurity/Decepticon?style=for-the-badge&color=blue" alt="License: Apache 2.0">
 </a>
-<a href="https://github.com/PurpleAILAB/Decepticon/stargazers">
-  <img src="https://img.shields.io/github/stars/PurpleAILAB/Decepticon?style=for-the-badge&color=yellow" alt="Stargazers">
+<a href="https://github.com/BitterSecurity/Decepticon/stargazers">
+  <img src="https://img.shields.io/github/stars/BitterSecurity/Decepticon?style=for-the-badge&color=yellow" alt="Stargazers">
 </a>
-<a href="https://github.com/PurpleAILAB/Decepticon/graphs/contributors">
-  <img src="https://img.shields.io/github/contributors/PurpleAILAB/Decepticon?style=for-the-badge&color=orange" alt="Contributors">
+<a href="https://github.com/BitterSecurity/Decepticon/graphs/contributors">
+  <img src="https://img.shields.io/github/contributors/BitterSecurity/Decepticon?style=for-the-badge&color=orange" alt="Contributors">
 </a>
 
 <br/>
@@ -93,6 +93,36 @@ decepticon
 
 → **[Quick start](docs/getting-started.md)** · **[Full setup walkthrough](docs/setup-guide.md)**
 
+### Inside the interactive CLI
+
+Type `/` to browse commands, select with Up/Down, then press Enter. Tab completes
+the selected command; aliases also appear in help and autocomplete.
+
+| Command | Use |
+|---------|-----|
+| `/help`, `/shortcuts` | Discover commands or keyboard shortcuts |
+| `/model`, `/status` | Choose a configured model or inspect session connections |
+| `/plan` | Enter optional Plan mode, then send your planning message |
+| `/mode red`, `/mode blue` | Return to Red or select Blue investigation |
+| `/new` | Start a fresh conversation in the same engagement and mode when idle |
+| `/sessions`, `/resume` | Browse saved conversations or continue paused work |
+| `/version` (`/about`), `/pwd` (`/cwd`) | Check the running version and workspace paths |
+| `/quit`, `/exit` | Leave the chat; services and server work keep running |
+
+Enter sends; Shift+Enter, Alt+Enter or Ctrl+J adds a line. Up/Down recalls input
+history at the first/last input row; Ctrl+R searches it. Esc closes focused UI
+first, then pauses active work; `/resume` continues it. Ctrl+A moves to the start
+of the current line. Use `/queue` to review waiting messages before `/new`.
+
+`/new` preserves saved conversations and terminal scrollback; it does not create
+another engagement or change target authorization. `/plan` and `/new` take no
+arguments. In the web terminal, use the dashboard's mode controls.
+
+The new shortcuts and slash conveniences above describe current `main`, including
+unreleased changes. A source merge does not update installed images. See
+[version history](CHAGELOG.md), the [complete CLI reference](docs/cli-reference.md#slash-commands)
+and [upgrade behavior](docs/cli-experience.md#upgrade-behavior).
+
 ### Use from Claude Code or Codex
 
 After starting Decepticon, register its MCP server in your coding agent:
@@ -136,10 +166,10 @@ We're building Decepticon toward an **Offensive Vaccine** for the AI-driven thre
 
 | Benchmark | Difficulty | Pass Rate |
 |-----------|------------|-----------|
-| [XBOW validation-benchmarks](https://github.com/PurpleAILAB/xbow-validation-benchmarks) | Easy (Level 1)   | **45 / 45** (100 %) |
-| [XBOW validation-benchmarks](https://github.com/PurpleAILAB/xbow-validation-benchmarks) | Medium (Level 2) | **50 / 51** (98.0 %) |
-| [XBOW validation-benchmarks](https://github.com/PurpleAILAB/xbow-validation-benchmarks) | Hard (Level 3)   | **7 / 8** (87.5 %) |
-| [XBOW validation-benchmarks](https://github.com/PurpleAILAB/xbow-validation-benchmarks) | **All levels**   | **102 / 104** (98.08 %) |
+| [XBOW validation-benchmarks](https://github.com/BitterSecurity/xbow-validation-benchmarks) | Easy (Level 1)   | **45 / 45** (100 %) |
+| [XBOW validation-benchmarks](https://github.com/BitterSecurity/xbow-validation-benchmarks) | Medium (Level 2) | **50 / 51** (98.0 %) |
+| [XBOW validation-benchmarks](https://github.com/BitterSecurity/xbow-validation-benchmarks) | Hard (Level 3)   | **7 / 8** (87.5 %) |
+| [XBOW validation-benchmarks](https://github.com/BitterSecurity/xbow-validation-benchmarks) | **All levels**   | **102 / 104** (98.08 %) |
 
 - **[Full per-challenge index, attack-class matrix, and LangSmith traces](benchmark/results/README.md)**
 - **[Comparison vs other AI pentest agents (Strix, PentestGPT, MAPTA, Cyber-AutoAgent, XBOW commercial, …)](docs/benchmark-comparison.md)**
@@ -152,7 +182,7 @@ The "AI + hacking" space is full of demos that run nmap and print a report. That
 
 **Decepticon is a professional autonomous Red Team agent.** It executes realistic attack chains — reconnaissance, exploitation, privilege escalation, lateral movement, C2 — the way a real adversary would, not the way a scanner does.
 
-But more importantly: it operates under the discipline that separates red teamers from script kiddies. Before a single packet leaves the wire, Decepticon generates a complete engagement package — **RoE**, **ConOps**, **Deconfliction Plan**, and **OPPLAN** with MITRE ATT&CK mapping — and every action runs inside those defined rules.
+Every Red engagement starts with an operator-approved target and RoE. Optional Plan mode adds Soundwave's discussion and seven planning documents alongside the read-only RoE. The execution orchestrator owns OPPLAN; Plan is not required for Red.
 
 → **[Engagement workflow deep dive](docs/engagement-workflow.md)**
 
@@ -215,16 +245,22 @@ Configure via `decepticon onboard`. → **[Full model reference & fallback examp
 |-------|-----|
 | Installation and first engagement | [Getting Started](docs/getting-started.md) |
 | Complete setup, OAuth, providers, dashboard | [Setup Guide](docs/setup-guide.md) |
+| Coding-agent CLI wrapper | [Decepticon skill](skills/decepticon/SKILL.md) |
+| Documentation and repository map | [Documentation index](docs/README.md) |
 | All CLI commands and keyboard shortcuts | [CLI Reference](docs/cli-reference.md) |
 | All `make` targets | [Makefile Reference](docs/makefile-reference.md) |
 | Agent roster and middleware | [Agents](docs/agents.md) |
+| REA/Ghidra reverse engineering | [REA Reversing](docs/features/rea-reversing.md) |
+| Local defensive monitoring | [Blue Cell](docs/features/blue-cell.md) |
 | Model profiles and fallback chain | [Models](docs/models.md) |
 | Skill system and format spec | [Skills](docs/skills.md) |
 | Web dashboard features and setup | [Web Dashboard](docs/web-dashboard.md) |
+| Extending capabilities, skills, workflows and clients | [Extension contract](docs/design/extension-contract.md) |
 | System architecture and network isolation | [Architecture](docs/architecture.md) |
 | Neo4j knowledge graph | [Knowledge Graph](docs/knowledge-graph.md) |
 | End-to-end engagement workflow | [Engagement Workflow](docs/engagement-workflow.md) |
 | Offensive Vaccine loop | [Offensive Vaccine](docs/offensive-vaccine.md) |
+| Release history | [Changelog](CHAGELOG.md) |
 | Contributing to Decepticon | [Contributing](docs/contributing.md) |
 
 ---
@@ -232,7 +268,7 @@ Configure via `decepticon onboard`. → **[Full model reference & fallback examp
 ## Contributing
 
 ```bash
-git clone https://github.com/PurpleAILAB/Decepticon.git
+git clone https://github.com/BitterSecurity/Decepticon.git
 cd Decepticon
 make dogfood  # Full OSS UX (launcher → onboard → CLI) on local code
 make dev      # Backend hot-reload (compose watch) — daily dev loop
@@ -260,6 +296,28 @@ Do not use this project on any system or network without explicit written author
 
 ---
 
-<div align="center">
-  <img src="assets/main.png" alt="Decepticon">
-</div>
+## Acknowledgements
+
+Thanks to the maintainers and contributors of the projects Decepticon builds on,
+integrates, and learns from.
+
+| Project | Role in Decepticon |
+|---------|--------------------|
+| [REA](https://github.com/morluto/rea) and [Ghidra](https://github.com/NationalSecurityAgency/ghidra) | Optional reverse engineering workload and evidence-backed binary analysis. [Integration details](docs/features/rea-reversing.md). |
+| [Deep Agents](https://github.com/langchain-ai/deepagents) and [LangGraph](https://github.com/langchain-ai/langgraph) | Agent harness, orchestration, streaming and persistent execution state. |
+| [LiteLLM](https://github.com/BerriAI/litellm) | Model gateway and provider routing. |
+| [insane-search](https://github.com/fivetaku/insane-search) | Upstream engine adapted for sandbox web access. [Adaptation notice](packages/decepticon/decepticon/sandbox_web/NOTICE.md). |
+| [Playwright](https://github.com/microsoft/playwright) | Browser automation for web investigation. |
+| [Caddy](https://github.com/caddyserver/caddy) and [Fluent Bit](https://github.com/fluent/fluent-bit) | Local Blue sensor ingress and log collection. [Blue Cell architecture](docs/features/blue-cell.md). |
+| [Ink](https://github.com/vadimdemedes/ink), [Bubble Tea](https://github.com/charmbracelet/bubbletea) and [Huh](https://github.com/charmbracelet/huh) | Interactive CLI rendering and launcher forms. |
+| [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings), [h4cker](https://github.com/The-Art-of-Hacking/h4cker) and [Awesome-Hacking](https://github.com/Hack-with-Github/Awesome-Hacking) | Security knowledge and learning references. [Attribution details](THIRD_PARTY_LICENSES.md). |
+| [XBOW validation benchmarks](https://github.com/XBOW-engineering/validation-benchmarks) | Evaluation tasks used by the benchmark integration. [Results and methodology](benchmark/results/README.md). |
+
+For CLI interaction design, we also studied
+[Claude Code](https://code.claude.com/docs/en/interactive-mode),
+[Codex CLI](https://github.com/openai/codex) and
+[Gemini CLI](https://github.com/google-gemini/gemini-cli).
+The [CLI reference review](docs/cli-experience.md) records the resulting choices.
+
+Upstream licenses and attribution notices remain applicable; see
+[third-party licenses](THIRD_PARTY_LICENSES.md) and the notices alongside adapted code.

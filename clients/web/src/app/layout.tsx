@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
+import { connection } from "next/server";
+import { browserConfig } from "@/lib/browser-config";
+import { BrowserConfigProvider } from "@/lib/browser-config-context";
 import { Geist, Geist_Mono } from "next/font/google";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ThemeProvider } from "@/components/theme-provider";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -22,18 +26,31 @@ export const metadata: Metadata = {
   },
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
-}>) {
+}>): Promise<React.ReactNode> {
+  await connection();
+  const config = browserConfig(process.env);
+
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} dark h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
       <body className="min-h-full bg-background text-foreground">
-        <TooltipProvider>{children}</TooltipProvider>
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="dark"
+          enableSystem
+          disableTransitionOnChange
+        >
+          <BrowserConfigProvider config={config}>
+            <TooltipProvider>{children}</TooltipProvider>
+          </BrowserConfigProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

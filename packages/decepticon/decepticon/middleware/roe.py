@@ -1,40 +1,17 @@
-"""RoE guardrail middleware - the advisory command-parse RoE gate.
+"""Enforce machine RoE on configured tool calls and record decisions.
 
-This middleware sits between the LLM and the tool surface. Every
-``bash`` (and other tool) call is evaluated against the engagement's
-``roe.json:machine_enforcement`` block. The outcome is one of:
+Rules are loaded from the request workspace's plan/roe.json. Missing or invalid
+machine configuration is refused; legacy mode keys do not enable audit-only or
+warning-only execution. Abort, time windows, command/target rules, concurrency
+and cadence are checked around gated calls.
 
-  * **PASS** in audit mode - logged, allowed to proceed.
-  * **WARN** in warn mode - logged, a SystemMessage is appended to the
-    tool's return so the model sees it failed RoE, but the call still
-    executes.
-  * **REFUSE** in enforce mode - logged, the tool call short-circuits
-    with a ``[ROE_REFUSED]`` ToolMessage before the handler runs.
-
-Defense-in-depth: this middleware is a *guardrail*, not the sole gate.
-It parses the literal command text for target hosts, which is a strong
-**fast-fail UX signal** (it tells the model early, before a wasted
-round-trip) but cannot be the authoritative boundary — a determined
-agent can hide a target behind variable indirection, command
-substitution, or DNS resolution the parser never sees. The
-authoritative scope boundary is the sandbox's network **egress**
-(``middleware/egress.py`` → DNS allowlist + nftables connect
-allowlist), compiled from the *same* ``machine_enforcement`` rules, so
-the packet cannot leave even when the parse misses. One scope
-definition, two enforcement points.
-
-Every decision (PASS too, not just REFUSE) lands in the HMAC-chained
-audit ledger via :class:`RoEAuditSink`. The ledger is the legal record
-of "what the agent tried, what was approved, what was blocked" - the
-key artifact for paid / regulated engagement out-briefs.
-
-Reading the RoE:
-
-  * Default location: ``<workspace>/plan/roe.json``.
-  * Resolved per-iteration from ``state["workspace_path"]`` so the
-    middleware can hot-reload an operator-edited RoE without restart.
-  * ``machine_enforcement`` block is optional - when absent, the
-    middleware logs every tool call but never blocks (``mode=audit``).
+Target extraction is best-effort. The network boundary is exclusively the
+OpenShell kernel policy: it is attached at sandbox creation by the trusted
+resolver and provisioning here verifies the admitted policy hash against
+the RoE compiled from the same machine block
+(``decepticon.middleware.policy_compiler``). An unverifiable boundary, or
+a backend without OpenShell authority, fails loudly instead of running
+unprotected — the legacy in-container nftables path has been retired.
 """
 
 from __future__ import annotations
@@ -63,7 +40,6 @@ from decepticon.middleware._audit_sink import RoEAuditSink
 from decepticon.middleware._command_targets import extract_targets
 from decepticon_core.types.roe import (
     Decision,
-    EnforcementMode,
     MachineEnforcement,
     evaluate_command,
     evaluate_target,
@@ -139,16 +115,18 @@ NETWORK_TARGET_EXTRACTORS: dict[str, Callable[[dict[str, Any]], list[str]]] = {
 
 def _load_rules_for_workspace(workspace_path: str | None) -> MachineEnforcement:
     if not workspace_path:
-        return MachineEnforcement()
+        return MachineEnforcement(configured=False)
     roe_path = Path(workspace_path) / "plan" / "roe.json"
     if not roe_path.exists():
-        return MachineEnforcement()
+        return MachineEnforcement(configured=False)
     try:
         data = json.loads(roe_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning("roe: failed to read %s: %s; defaulting to audit-only mode", roe_path, exc)
-        return MachineEnforcement()
+        log.warning("roe: failed to read %s: %s; refusing gated tools", roe_path, exc)
+        return MachineEnforcement(configured=False)
     block = data.get("machine_enforcement") if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        return MachineEnforcement(configured=False)
     return MachineEnforcement.from_dict(block)
 
 
@@ -275,20 +253,25 @@ def _command_from_tool_call(request) -> str:
 
 
 def _egress_disabled() -> bool:
-    """Whether the Layer-2 egress guardrail is turned OFF (opt-out).
+    """Deprecated opt-out flag, retained only to warn the operator.
 
-    Default ON: an ``enforce``-mode engagement automatically gets the
-    authoritative network boundary compiled + pushed to the sandbox — no
-    extra env needed. ``DECEPTICON_EGRESS_DISABLE=1`` is the escape hatch
-    for an operator whose environment the in-sandbox firewall doesn't fit
-    (it falls back to the parser layer alone). audit / warn modes never
-    touch the network regardless.
+    The nftables in-sandbox firewall this flag used to bypass has been
+    removed: OpenShell is the only network-boundary authority, and the
+    kernel policy is attached at sandbox creation by the trusted resolver
+    — there is no provisioning step left to disable. Setting the flag
+    changes nothing; the run keeps its OpenShell boundary.
     """
-    return os.environ.get("DECEPTICON_EGRESS_DISABLE", "").strip().lower() in {
+    disabled = os.environ.get("DECEPTICON_EGRESS_DISABLE", "").strip().lower() in {
         "1",
         "true",
         "yes",
     }
+    if disabled:
+        log.warning(
+            "roe: DECEPTICON_EGRESS_DISABLE is retired; OpenShell kernel "
+            "policies are structural and cannot be disabled per-run"
+        )
+    return disabled
 
 
 class RoEGuardrailMiddleware(AgentMiddleware):
@@ -326,18 +309,20 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         self._pace_lock = threading.Lock()
         self._last_gated_monotonic = 0.0
         self._egress_lock = threading.Lock()
-        self._egress_provisioned: set[str] = set()
+        self._egress_provisioned: set[tuple[str, str, str]] = set()
 
     @override
     def before_agent(self, state, runtime) -> None:
-        self._maybe_provision_egress(state)
+        self._maybe_provision_egress(state, getattr(runtime, "config", None))
         return None
 
     @override
     async def abefore_agent(self, state, runtime) -> None:
         # Provisioning does a one-time synchronous HTTP round-trip to the
         # sandbox daemon; offload it so the event loop isn't blocked.
-        await asyncio.to_thread(self._maybe_provision_egress, state)
+        await asyncio.to_thread(
+            self._maybe_provision_egress, state, getattr(runtime, "config", None)
+        )
         return None
 
     @override
@@ -353,8 +338,8 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         if halt is not None:
             return halt
         decision, rules, tool_name = self._evaluate(request)
-        self._record(request, tool_name, decision, rules.mode)
-        if not decision.allow and rules.mode == EnforcementMode.ENFORCE:
+        self._record(request, tool_name, decision)
+        if not decision.allow:
             return _refused_message(decision, tool_name, _tcid(request))
         wait = self._pace_wait_seconds(rules)
         if wait > 0:
@@ -363,12 +348,6 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         gated = tool_name in self._gated
         with self._sync_gate(rules, gated):
             result = handler(request)
-        if (
-            not decision.allow
-            and rules.mode == EnforcementMode.WARN
-            and isinstance(result, ToolMessage)
-        ):
-            return _warn_message(decision, result)
         return result
 
     async def _dispatch_async(self, request, handler):
@@ -376,8 +355,8 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         if halt is not None:
             return halt
         decision, rules, tool_name = self._evaluate(request)
-        self._record(request, tool_name, decision, rules.mode)
-        if not decision.allow and rules.mode == EnforcementMode.ENFORCE:
+        self._record(request, tool_name, decision)
+        if not decision.allow:
             return _refused_message(decision, tool_name, _tcid(request))
         wait = self._pace_wait_seconds(rules)
         if wait > 0:
@@ -386,12 +365,6 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         gated = tool_name in self._gated
         async with self._async_gate(rules, gated):
             result = await handler(request)
-        if (
-            not decision.allow
-            and rules.mode == EnforcementMode.WARN
-            and isinstance(result, ToolMessage)
-        ):
-            return _warn_message(decision, result)
         return result
 
     def _resolve_limit(self, rules: MachineEnforcement) -> int | None:
@@ -467,45 +440,92 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         except Exception as exc:  # noqa: BLE001 - audit must never break tool execution
             log.error("roe: audit sink write failed: %s", exc)
 
-    def _maybe_provision_egress(self, state) -> None:
-        """Compile + push the Layer-2 egress guardrail, once per workspace.
+    def _maybe_provision_egress(self, state, config=None) -> None:
+        """Verify the OpenShell kernel boundary on every agent admission.
 
-        Default ON for ``enforce`` mode: skipped only when the operator
-        opts out via ``DECEPTICON_EGRESS_DISABLE``. audit / warn modes
-        never reach here (guarded below). Best-effort: any failure is
-        logged and never propagates into agent execution.
+        OpenShell is the only network-boundary authority: the trusted
+        resolver attaches the compiled RoE policy at sandbox creation, so
+        provisioning here verifies that the admitted policy hash still
+        matches the workspace's RoE. A backend without OpenShell authority
+        cannot provide a kernel network boundary at all — provisioning
+        raises before model/tool execution and leaves a later turn free to retry
+        (there is no nftables fallback to quietly run on).
         """
-        if _egress_disabled():
-            return
         get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
         workspace = get("workspace_path") or None
         if not workspace:
             return
+        _egress_disabled()  # deprecated: warn only, never bypasses the boundary
         rules = _load_rules_for_workspace(workspace)
-        if rules.mode != EnforcementMode.ENFORCE:
-            return
-        with self._egress_lock:
-            if workspace in self._egress_provisioned:
-                return
-            self._egress_provisioned.add(workspace)
-        try:
-            from decepticon.backends.factory import build_sandbox_backend
-            from decepticon.middleware.egress import compile_egress_policy
+        # Every materialized RoE is enforced; there is no audit/warn bypass.
 
-            policy = compile_egress_policy(rules)
-            result = build_sandbox_backend().provision_egress(policy)
-            log.info(
-                "roe: egress provisioned for %s: applied=%s detail=%s",
-                workspace,
-                result.get("applied"),
-                result.get("detail"),
+        # Hold admission until verification completes. A concurrent caller may
+        # never treat an in-progress check as a successful cached admission.
+        with self._egress_lock:
+            from decepticon.backends.factory import build_sandbox_backend
+
+            backend = build_sandbox_backend(config)
+            if getattr(backend, "egress_authority", "") != "openshell":
+                raise RuntimeError(
+                    "RoE requires an admitted OpenShell kernel boundary; "
+                    "configure DECEPTICON_SANDBOX_PROVIDER=openshell"
+                )
+            compiled = self._verify_openshell_boundary(state, workspace, rules, backend)
+            key = (workspace, compiled.canonical_hash, backend.id)
+            if key not in self._egress_provisioned:
+                self._record_provision(state, compiled)
+                self._egress_provisioned.add(key)
+
+    def _verify_openshell_boundary(self, state, workspace, rules, backend):
+        """Confirm the admitted OpenShell policy is compiled from this RoE.
+
+        The kernel policy is the authoritative boundary, so it must be
+        provably derived from ``plan/roe.json``: the admission's
+        ``effective_policy_hash`` must equal the hash of the policy this
+        module compiles from the same machine block. Anything else means
+        the sandbox's network contract cannot be tied to the operator's
+        scope and provisioning fails loudly for a later retry.
+        """
+        from decepticon.middleware.policy_compiler import compile_openshell_policy
+
+        compiled = compile_openshell_policy(rules)
+        if compiled.errors:
+            raise RuntimeError(
+                "RoE cannot be compiled into an OpenShell policy: " + "; ".join(compiled.errors)
             )
-        except Exception as exc:  # noqa: BLE001 - provisioning must never break the run
-            log.error("roe: egress provisioning failed for %s: %s", workspace, exc)
-            # Un-mark so a later agent turn can retry rather than silently
-            # leaving the engagement with no network boundary.
-            with self._egress_lock:
-                self._egress_provisioned.discard(workspace)
+        backend.check_admission()
+        admission = backend.current_admission()
+        if admission.effective_policy_hash != compiled.canonical_hash:
+            raise RuntimeError(
+                "OpenShell admission policy hash does not match the compiled "
+                f"RoE policy ({admission.effective_policy_hash[:12]} != "
+                f"{compiled.canonical_hash[:12]}); refusing to admit agents "
+                "on an unverifiable boundary"
+            )
+        log.info(
+            "roe: openshell kernel boundary verified for %s: policy=%s",
+            workspace,
+            compiled.canonical_hash[:12],
+        )
+
+        return compiled
+
+    def _record_provision(self, state, compiled) -> None:
+        if self._sink is None:
+            return
+        get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
+        record = {
+            "ts": time.time(),
+            "engagement": get("engagement_name") or "unknown-engagement",
+            "objective_id": get("active_objective_id") or get("current_objective") or "",
+            "event": "egress_provisioned",
+            "authority": "openshell",
+            "policy_hash": compiled.canonical_hash,
+        }
+        try:
+            self._sink.append(record)
+        except Exception as exc:  # noqa: BLE001 - audit must never break tool execution
+            log.error("roe: provisioning audit write failed: %s", exc)
 
     def _evaluate(self, request) -> tuple[Decision, MachineEnforcement, str]:
         tool = getattr(request, "tool", None)
@@ -516,6 +536,16 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
         workspace = get("workspace_path") or None
         rules = _load_rules_for_workspace(workspace)
+        if not rules.configured:
+            return (
+                Decision.refuse(
+                    code="ROE_CONFIG_MISSING",
+                    detail="machine-readable RoE is missing or invalid; gated tool execution is fail-closed",
+                    risk="high",
+                ),
+                rules,
+                tool_name,
+            )
         time_decision = evaluate_time_window(self._now(), rules)
         if not time_decision.allow:
             return time_decision, rules, tool_name
@@ -543,7 +573,6 @@ class RoEGuardrailMiddleware(AgentMiddleware):
         request,
         tool_name: str,
         decision: Decision,
-        mode: EnforcementMode,
     ) -> None:
         if self._sink is None:
             return
@@ -561,7 +590,7 @@ class RoEGuardrailMiddleware(AgentMiddleware):
             "reason_detail": decision.reason_detail,
             "risk": decision.risk,
             "matched_targets": list(decision.matched_targets),
-            "mode": mode.value,
+            "enforced": True,
             "command_excerpt": _redact_secrets(_command_from_tool_call(request))[:512],
         }
         try:
@@ -634,9 +663,10 @@ def build_default_sink(workspace_path: str | None) -> RoEAuditSink | None:
     return RoEAuditSink(path=Path(workspace_path) / "audit" / "roe-decisions.jsonl")
 
 
-# Compat alias (removed at 2.0.0). The class was renamed
+# Retained compatibility alias; the planned 2.0.0 removal did not occur.
+# The class was renamed
 # ``RoEEnforcementMiddleware`` → ``RoEGuardrailMiddleware`` when RoE
 # enforcement became genuinely layered (advisory command-parse here +
 # authoritative sandbox egress). Downstream plugins / downstream subagents
-# that import the old name keep working for one minor cycle.
+# that import the old name still resolve it; new code uses RoEGuardrailMiddleware.
 RoEEnforcementMiddleware = RoEGuardrailMiddleware

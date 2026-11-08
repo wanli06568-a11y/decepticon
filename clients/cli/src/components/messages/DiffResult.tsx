@@ -12,8 +12,8 @@
  *   ● Update(src/components/TodoList.tsx)
  *     ⎿  Added 1 line, removed 6 lines
  *        -const STATUS_ICON: Record<string, …> = {
- *        -  completed: { icon: "✓", color: "green" },
- *        -  pending: { icon: "☐", color: "gray" },
+ *        -  completed: { icon: "✓", color: PALETTE.success },
+ *        -  pending: { icon: "☐", color: PALETTE.muted },
  *        -};
  *        +import { TODO_ICON } from "../utils/theme.js";
  */
@@ -21,7 +21,7 @@
 import React, { useMemo } from "react";
 import { Box, Text } from "ink";
 import { diffLines, type Change } from "diff";
-import { GLYPH_DOT, GLYPH_HOOK } from "../../utils/theme.js";
+import { PALETTE, GLYPH_DOT, GLYPH_HOOK } from "../../utils/theme.js";
 import { shortPath } from "../../utils/format.js";
 import { useScreen } from "../shell/ScreenContext.js";
 import { CtrlOToExpand } from "../shell/CtrlOToExpand.js";
@@ -110,14 +110,14 @@ export const DiffResult = React.memo(function DiffResult({
   if (status === "error") {
     return (
       <Box flexDirection="column" marginTop={1}>
-        <Text>
-          <Text color="red">{`${GLYPH_DOT} `}</Text>
-          <Text bold>Update</Text>
-          <Text dimColor italic>{`(${shortPath(filePath)})`}</Text>
+        <Text color={PALETTE.text}>
+          <Text color={PALETTE.error}>{`${GLYPH_DOT} `}</Text>
+          <Text color={PALETTE.text} bold>Update</Text>
+          <Text color={PALETTE.text} dimColor italic>{`(${shortPath(filePath)})`}</Text>
         </Text>
-        <Text>
-          <Text dimColor>{`  ${GLYPH_HOOK}  `}</Text>
-          <Text color="red">{content}</Text>
+        <Text color={PALETTE.text}>
+          <Text color={PALETTE.text} dimColor>{`  ${GLYPH_HOOK}  `}</Text>
+          <Text color={PALETTE.error}>{content}</Text>
         </Text>
       </Box>
     );
@@ -127,13 +127,13 @@ export const DiffResult = React.memo(function DiffResult({
   if (!isTranscript) {
     return (
       <Box flexDirection="column" marginTop={1}>
-        <Text>
-          <Text color="green">{`${GLYPH_DOT} `}</Text>
-          <Text bold>Update</Text>
-          <Text dimColor italic>{`(${shortPath(filePath)})`}</Text>
+        <Text color={PALETTE.text}>
+          <Text color={PALETTE.success}>{`${GLYPH_DOT} `}</Text>
+          <Text color={PALETTE.text} bold>Update</Text>
+          <Text color={PALETTE.text} dimColor italic>{`(${shortPath(filePath)})`}</Text>
         </Text>
-        <Text>
-          <Text dimColor>{`  ${GLYPH_HOOK}  ${summary}`}</Text>
+        <Text color={PALETTE.text}>
+          <Text color={PALETTE.text} dimColor>{`  ${GLYPH_HOOK}  ${summary}`}</Text>
           <CtrlOToExpand />
         </Text>
       </Box>
@@ -153,14 +153,14 @@ export const DiffResult = React.memo(function DiffResult({
   return (
     <Box flexDirection="column" marginTop={1}>
       {/* Header: ● Update(path) */}
-      <Text>
-        <Text color="green">{`${GLYPH_DOT} `}</Text>
-        <Text bold>Update</Text>
-        <Text dimColor italic>{`(${shortPath(filePath)})`}</Text>
+      <Text color={PALETTE.text}>
+        <Text color={PALETTE.success}>{`${GLYPH_DOT} `}</Text>
+        <Text color={PALETTE.text} bold>Update</Text>
+        <Text color={PALETTE.text} dimColor italic>{`(${shortPath(filePath)})`}</Text>
       </Text>
 
       {/* Summary: ⎿  Added N lines, removed M lines */}
-      <Text dimColor>{`  ${GLYPH_HOOK}  ${summary}`}</Text>
+      <Text color={PALETTE.text} dimColor>{`  ${GLYPH_HOOK}  ${summary}`}</Text>
 
       {/* Diff lines with line numbers */}
       {visible.map((line, i) => {
@@ -169,22 +169,22 @@ export const DiffResult = React.memo(function DiffResult({
         switch (line.type) {
           case "remove":
             return (
-              <Text key={i} wrap="truncate">
-                <Text dimColor>{`     ${num} `}</Text>
-                <Text color="red">{`-${line.text}`}</Text>
+              <Text color={PALETTE.text} key={i} wrap="truncate">
+                <Text color={PALETTE.text} dimColor>{`     ${num} `}</Text>
+                <Text color={PALETTE.error}>{`-${line.text}`}</Text>
               </Text>
             );
           case "add":
             return (
-              <Text key={i} wrap="truncate">
-                <Text dimColor>{`     ${num} `}</Text>
-                <Text color="green">{`+${line.text}`}</Text>
+              <Text color={PALETTE.text} key={i} wrap="truncate">
+                <Text color={PALETTE.text} dimColor>{`     ${num} `}</Text>
+                <Text color={PALETTE.success}>{`+${line.text}`}</Text>
               </Text>
             );
           default:
             return (
-              <Text key={i} wrap="truncate">
-                <Text dimColor>{`     ${num}  ${line.text}`}</Text>
+              <Text color={PALETTE.text} key={i} wrap="truncate">
+                <Text color={PALETTE.text} dimColor>{`     ${num}  ${line.text}`}</Text>
               </Text>
             );
         }

@@ -3,7 +3,7 @@
 Originally lived inline in ``decepticon/backends/docker_sandbox.py``. Moved
 out so the in-container HTTP daemon (``decepticon.sandbox_server``) can
 import it without pulling in the agent-side ``DockerSandbox`` /
-``HTTPSandbox`` transport classes — see ``sandbox_kernel/__init__.py``
+``HTTPTransportSandbox`` transport classes — see ``sandbox_kernel/__init__.py``
 for the layering rationale.
 """
 
@@ -33,6 +33,7 @@ class BackgroundJob:
     exit_code: int | None = None
     completed_at: float | None = None
     consumed: bool = False
+    generation: str | None = None
 
     @property
     def elapsed(self) -> float:

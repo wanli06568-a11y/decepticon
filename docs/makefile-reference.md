@@ -1,6 +1,6 @@
 # Makefile Reference
 
-The Makefile is for **local development and pre-release verification**. Every Docker target builds from your local checkout. End users install via `curl | bash` and run `decepticon` — they don't use `make`.
+The Makefile is for **local development and pre-release verification**. Build targets use your local checkout; operations/test targets can act on already-running services. End users install via `curl | bash` and run `decepticon` — they don't use `make`.
 
 Run `make help` for a quick summary. Full reference below.
 
@@ -50,7 +50,7 @@ The Web dashboard is optional. Start it from the CLI with `/web`; it is then rea
 
 | Target | Description |
 |--------|-------------|
-| `make quality` | Run all quality gates: Python lint + tests + CLI typecheck/build/test + Web lint/build |
+| `make quality` | Python lint/tests, CLI typecheck/build/tests, telemetry checks/build, and web lint/tests/build |
 | `make lint` | Python lint + type-check (`ruff check` + `ruff format --check` + `basedpyright`) |
 | `make lint-fix` | Auto-fix Python lint and formatting |
 | `make quality-cli` | CLI typecheck + build + test (`vitest`) |
@@ -110,7 +110,7 @@ Release channel policy (see [update-channels.md](./update-channels.md) for the u
 - GHCR version tags (`X.Y.Z`) are immutable release artifacts and should be used by installed deployments.
 - Two moving channel tags (Claude-Code-style soak model — both **final-only**):
   - GHCR `latest` → moved to the newest **final** release **immediately**, by the `publish-release` job (after all version-tagged images exist and the GitHub release is undrafted).
-  - GHCR `stable` → moved to the newest final release **baked ≥ the soak window** (default 7 days), by the **scheduled** `promote-stable.yml` workflow — *not* on release. The conservative default; the `${DECEPTICON_VERSION:-stable}` compose fallback resolves here.
+  - GHCR `stable` → moved to the newest final release **baked ≥ the soak window** (default 7 days), by the **scheduled** `promote-stable.yml` workflow — *not* on release. An explicit opt-in; the `${DECEPTICON_VERSION:-latest}` compose fallback uses the newest final release.
 - Pre-releases use SemVer suffixes such as `v1.1.0-rc.1`, stay marked as GitHub pre-releases, and move **neither** channel tag (the channels never auto-select them).
 - Bug fixes ship as new patch releases. Do not rebuild or rewrite an existing version tag.
 

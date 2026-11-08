@@ -19,8 +19,13 @@ import { useOpplan } from "../hooks/useOpplan.js";
 import { useSubAgentSessions } from "../hooks/useSubAgentSessions.js";
 import { useGlobalKeybindings } from "../hooks/useGlobalKeybindings.js";
 import { useAppState } from "../state/AppState.js";
+import { TranscriptPager } from "../components/TranscriptPager.js";
 import { Banner } from "../components/Banner.js";
+import { RuntimeFooter } from "../components/RuntimeFooter.js";
+import { BudgetFooter } from "../components/BudgetFooter.js";
 import { EventItem } from "../components/EventItem.js";
+import { AIMessage } from "../components/messages/AIMessage.js";
+import { PendingToolMessage } from "../components/messages/PendingToolMessage.js";
 import { ActivityIndicator } from "../components/ActivityIndicator.js";
 import { OpplanStatus } from "../components/OpplanStatus.js";
 import { Prompt } from "../components/Prompt.js";
@@ -29,18 +34,22 @@ import { AgentSessionGroup } from "../components/agents/AgentSessionGroup.js";
 import { CoordinatorPanel } from "../components/agents/CoordinatorPanel.js";
 import { ScreenProvider } from "../components/shell/ScreenContext.js";
 import { ExpandOutputProvider } from "../components/shell/ExpandOutputContext.js";
-import { SubAgentProvider } from "../components/shell/SubAgentContext.js";
-import { parseSlashCommand, findCommand } from "../commands/registry.js";
+import { parseSlashCommand, findCommand, suggestCommand } from "../commands/registry.js";
 import { groupConsecutiveTools } from "../utils/groupEvents.js";
-import { formatDuration } from "../utils/format.js";
-import { GLYPH_DOT, GLYPH_HOOK, GLYPH_SEP, AGENT_COLORS } from "../utils/theme.js";
 import { ToolGroupSummary } from "../components/messages/ToolGroupSummary.js";
-import type { CommandContext, CommandResult } from "../commands/types.js";
-import type { AgentEvent, ScreenMode, SubAgentSession } from "../types.js";
+import type { CommandContext } from "../commands/types.js";
+import type { AgentEvent, ScreenMode } from "../types.js";
 import { ErrorMessage } from "../components/messages/ErrorMessage.js";
-import { SessionPicker } from "../components/SessionPicker.js";
-import { listThreads } from "../utils/threadStore.js";
-import type { ThreadEntry } from "../utils/threadStore.js";
+import { CommandPicker } from "../components/CommandPicker.js";
+import { useLocalCommands } from "../hooks/useLocalCommands.js";
+import { useServiceStatus } from "../hooks/useServiceStatus.js";
+import { ConversationViewport } from "../components/ConversationViewport.js";
+import { SessionFooter } from "../components/SessionFooter.js";
+import { useTerminalUI } from "../terminal/TerminalUI.js";
+import { useTerminalSize } from "../hooks/useTerminalSize.js";
+import { PALETTE } from "../utils/theme.js";
+import { getModelOverride } from "../commands/modelOverride.js";
+import { CLI_VERSION } from "../utils/version.js";
 import type { ToolGroup } from "../utils/groupEvents.js";
 
 export type Screen = ScreenMode;
@@ -52,15 +61,41 @@ interface REPLProps {
 
 export function REPL({ initialMessage, resumeThread }: REPLProps) {
   const { exit } = useApp();
+  const terminal = useTerminalUI();
+  const size = useTerminalSize();
   const agent = useAgent({ resumeThread });
-  useBlueNotifications(agent.addSystemEvent);
+  // Blue Cell events surface into the conversation only in Blue mode — they
+  // must not invade the Red (or Plan) conversation. They still accumulate in
+  // the hook state and stay viewable in Blue mode via /alerts and the badge.
+  const blue = useBlueNotifications(
+    agent.addSystemEvent,
+    () => agent.assistantId === "autobot",
+  );
+  const connection = useServiceStatus();
   const opplan = useOpplan(agent.events);
   const sessions = useSubAgentSessions(agent.events);
   const screen = useAppState((s) => s.screen);
-  const [showSessionPicker, setShowSessionPicker] = useState(false);
-  const [pickerSessions, setPickerSessions] = useState<ThreadEntry[]>([]);
+  const [questionCommands, setQuestionCommands] = useState(false);
+  useEffect(() => setQuestionCommands(false), [agent.assistantId, agent.activeQuestion?.sourceId]);
+  const [hasDraft, setHasDraft] = useState(false);
+  const [composerModal, setComposerModal] = useState(false);
+  const [clearDraftToken, setClearDraftToken] = useState(0);
   // Increment to force <Static> re-mount on session switch (resets its internal render history)
   const [sessionKey, setSessionKey] = useState(0);
+  const onSessionSelected = useCallback(() => {
+    if (terminal.mode === "inline") process.stdout.write("\x1B[2J\x1B[H");
+    setSessionKey((value) => value + 1);
+  }, [terminal.mode]);
+  const local = useLocalCommands({ agent, blue, connection, onSessionSelected });
+  const initialPickerOpened = useRef(false);
+  useEffect(() => {
+    if (process.env.DECEPTICON_RESUME_PICKER !== "true" || initialPickerOpened.current) return;
+    initialPickerOpened.current = true;
+    void local.openSessions().catch((error: unknown) => agent.addSystemEvent(
+      error instanceof Error ? error.message : "Unable to load sessions."));
+  }, [local.openSessions, agent.addSystemEvent]);
+  const clearDraft = useCallback(() => { setHasDraft(false); setClearDraftToken((value) => value + 1); }, []);
+  const draftChanged = useCallback((value: string) => setHasDraft(value.length > 0), []);
 
   // Auto-submit initial message when DECEPTICON_INITIAL_MESSAGE env is set
   const autoStarted = useRef(false);
@@ -81,7 +116,10 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
     addSystemEvent: agent.addSystemEvent,
     runState: agent.runState,
     hasQueuedMessage: agent.queuedMessage != null,
-    modalActive: showSessionPicker || agent.activeQuestion != null,
+    modalActive: local.picker != null || composerModal || (agent.activeQuestion != null && !questionCommands),
+    draftHasText: hasDraft,
+    onClearDraft: clearDraft,
+    onModelPicker: () => handleSubmit("/model"),
   });
 
   // ── Command handling ────────────────────────────────────────────
@@ -90,10 +128,24 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
       addSystemEvent: agent.addSystemEvent,
       clearEvents: agent.clearEvents,
       submit: agent.submit,
+      selectAssistant: agent.selectAssistant,
+      mutateWorkspace: agent.mutateWorkspace,
       resume: agent.resume,
+      restoreSession: id => agent.resume(id, true),
+      terminalCommand: (name, value) => {
+        if (name === "tui") {
+          if (value === "inline" || value === "fullscreen") terminal.setMode(value);
+          else agent.addSystemEvent(`Terminal: ${terminal.mode}. Usage: /tui inline | fullscreen`);
+        } else {
+          if (value === "on" || value === "off") terminal.setMouse(value === "on");
+          else agent.addSystemEvent(`Mouse: ${terminal.mouse ? "on" : "off"}. Usage: /mouse on | off. Shift+drag uses native terminal selection.`);
+        }
+      },
       exit,
+      openPicker: local.setPicker,
+      runLocalCommand: local.runLocalCommand,
     }),
-    [agent.addSystemEvent, agent.clearEvents, agent.submit, agent.resume, exit],
+    [agent.addSystemEvent, agent.clearEvents, agent.submit, agent.selectAssistant, agent.mutateWorkspace, agent.resume, exit, local.setPicker, local.runLocalCommand, terminal],
   );
 
   const handleSubmit = useCallback(
@@ -104,41 +156,21 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
       // Slash commands always execute immediately (even during streaming)
       const parsed = parseSlashCommand(trimmed);
       if (parsed) {
-        // /resume with no args → open interactive session picker
-        if ((parsed.name === "resume" || parsed.name === "r") && !parsed.args) {
-          // If paused, resume from checkpoint directly
-          if (agent.runState === "paused") {
-            agent.resume();
-            return;
-          }
-          // Otherwise show session picker (async)
-          listThreads().then((savedSessions) => {
-            if (savedSessions.length === 0) {
-              agent.addSystemEvent("No previous sessions found.");
-              return;
-            }
-            setPickerSessions(savedSessions);
-            setShowSessionPicker(true);
-          }).catch(() => {
-            agent.addSystemEvent("Failed to load sessions.");
+        if (parsed.name === "answer" && agent.activeQuestion) { setQuestionCommands(false); return; }
+        const cmd = findCommand(parsed.name);
+        if (cmd) {
+          Promise.resolve().then(() => cmd.execute(parsed.args, commandContext)).then((result) => {
+            if (result?.shouldSubmit) agent.submit(parsed.args);
+          }).catch((error: unknown) => {
+            agent.addSystemEvent(error instanceof Error ? error.message : "Unable to execute command.");
           });
           return;
         }
-
-        const cmd = findCommand(parsed.name);
-        if (cmd) {
-          const result = cmd.execute(parsed.args, commandContext);
-          if (result && typeof (result as Promise<unknown>).then === "function") {
-            (result as Promise<CommandResult | void>).then((r) => {
-              if (r?.shouldSubmit) agent.submit(parsed.args);
-            });
-          } else if ((result as CommandResult | void)?.shouldSubmit) {
-            agent.submit(parsed.args);
-          }
-          return;
-        }
-        // Unknown command — show error
-        agent.addSystemEvent(`Unknown command: /${parsed.name}. Type /help for available commands.`);
+        // Unknown command — show error, with a nearest-command suggestion when
+        // the name looks like a typo (alias-aware, same as the launcher CLI).
+        const suggestion = suggestCommand(parsed.name);
+        const hint = suggestion ? ` Did you mean /${suggestion}?` : "";
+        agent.addSystemEvent(`Unknown command: /${parsed.name}.${hint} Type /help for available commands.`);
         return;
       }
 
@@ -149,7 +181,7 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
         agent.submit(trimmed);
       }
     },
-    [agent, commandContext],
+    [agent, commandContext, local.openSessions],
   );
 
   // ── Derive prompt-mode items ────────────────────────────────────
@@ -210,16 +242,43 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
     return null;
   }, [mainEvents]);
 
+  const footer = <SessionFooter assistantId={agent.assistantId} activeAgent={agent.activeAgent}
+    engagement={process.env.DECEPTICON_ENGAGEMENT} model={getModelOverride()}
+    connection={connection} runState={agent.runState} runtime={agent.runtimeStatus} budget={agent.budgetUsage} onCommand={handleSubmit} />;
+  if (terminal.mode === "fullscreen" && !agent.isRestoring) {
+    const viewportEvents: AgentEvent[] = agent.streamingText ? [...agent.events, { id: "__streaming__", type: "ai_message", timestamp: Date.now(), content: agent.streamingText }] : agent.events;
+    return <ScreenProvider value={screen}><Box flexDirection="column" height={size.rows} width={size.columns} overflowY="hidden" backgroundColor={PALETTE.ground}>
+      <Box flexShrink={0} paddingX={1} backgroundColor={PALETTE.raised}><Text bold color={PALETTE.focus}>Decepticon · {CLI_VERSION}</Text><Text color={PALETTE.muted}> · {screen === "transcript" ? "Transcript · Esc back" : "Conversation"} · /tui inline · /mouse off</Text></Box>
+      <ConversationViewport expandedAll={screen === "transcript"} events={viewportEvents} modalActive={local.picker != null || composerModal || agent.activeQuestion != null} sessionKey={`${sessionKey}-${agent.assistantId}`} />
+      <Box flexDirection="column" flexShrink={0}>
+        <ActivityIndicator runState={agent.runState} streamStats={agent.streamStats} assistantId={agent.assistantId} />
+        {agent.pendingTool && <Text color={PALETTE.muted} wrap="truncate-end">Running: {agent.pendingTool.name}</Text>}
+        {agent.error && <ErrorMessage content={agent.error} onDismiss={agent.clearError} />}
+        {local.picker ? <CommandPicker request={local.picker} onClose={() => local.setPicker(null)} onError={agent.addSystemEvent} />
+          : agent.activeQuestion && !questionCommands ? <QuestionPicker question={agent.activeQuestion} onSubmit={agent.answerQuestion} onCancel={() => setQuestionCommands(true)} />
+          : <Prompt hideStatus runState={agent.runState} onSubmit={handleSubmit} assistantId={agent.assistantId} onDraftChange={draftChanged} onModalChange={setComposerModal} clearDraftToken={clearDraftToken} queuedMessage={agent.queuedMessage} onEditQueue={agent.enqueue} />}
+        {footer}
+      </Box>
+    </Box></ScreenProvider>;
+  }
+
   // ── TRANSCRIPT MODE ─────────────────────────────────────────────
+  if (agent.isRestoring) return <Text color={PALETTE.text} dimColor>Restoring conversation…</Text>;
   if (screen === "transcript") {
     return (
       <ScreenProvider value="transcript">
         <Box flexDirection="row">
           <Box flexDirection="column" flexGrow={1}>
-            <TranscriptView
-              events={agent.events}
-              sessions={sessions}
-            />
+            <TranscriptPager events={agent.events} modalActive={local.picker != null || composerModal} />
+            {local.picker ? (
+              <CommandPicker request={local.picker} onClose={() => local.setPicker(null)} onError={agent.addSystemEvent} />
+            ) : (
+              <Prompt hideStatus runState={agent.runState} assistantId={agent.assistantId} connectionStatus={connection}
+                onModalChange={setComposerModal} onDraftChange={draftChanged} clearDraftToken={clearDraftToken}
+                onSubmit={value => value.trim().startsWith("/") ? handleSubmit(value) : agent.addSystemEvent("Use a /command here, or Esc to return to chat.")} />
+            )}
+            {agent.error && <ErrorMessage content={agent.error} onDismiss={agent.clearError} />}
+            {footer}
           </Box>
         </Box>
       </ScreenProvider>
@@ -232,7 +291,7 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
       <Box flexDirection="row">
         <Box flexDirection="column" flexGrow={1}>
           {/* Static region: banner + completed events + completed sessions */}
-          <Static key={sessionKey} items={staticItems}>
+          <Static key={`${sessionKey}-${agent.assistantId}`} items={staticItems}>
             {(item) => (
               <Box key={item.id}>
                 {item.kind === "banner" ? (
@@ -268,14 +327,18 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
           <ActivityIndicator
             runState={agent.runState}
             streamStats={agent.streamStats}
+            assistantId={agent.assistantId}
           />
+
+          {agent.pendingTool && <PendingToolMessage tool={agent.pendingTool} />}
+          {agent.streamingText && <AIMessage content={agent.streamingText} streaming />}
 
           {/* Persistent OPPLAN display */}
           {opplan && opplan.objectives.length > 0 && (
             <OpplanStatus opplan={opplan} />
           )}
 
-          {agent.error && <ErrorMessage content={agent.error} />}
+          {agent.error && <ErrorMessage content={agent.error} onDismiss={agent.clearError} />}
 
           {/* No global "(ctrl+o to expand)" hint here: the Prompt footer
               already shows "ctrl+o: expand" persistently while idle, and
@@ -284,209 +347,43 @@ export function REPL({ initialMessage, resumeThread }: REPLProps) {
               region duplicated whichever hint the last item already showed,
               producing two identical "(ctrl+o to expand)" lines. */}
 
-          {showSessionPicker ? (
-            <SessionPicker
-              sessions={pickerSessions}
-              onSelect={(session: ThreadEntry) => {
-                setShowSessionPicker(false);
-                // Clear terminal + force <Static> re-mount so previous session
-                // output is fully removed (Static is append-only internally).
-                process.stdout.write("\x1B[2J\x1B[H");
-                setSessionKey((k) => k + 1);
-                agent.resume(session.threadId);
-              }}
-              onCancel={() => setShowSessionPicker(false)}
-            />
-          ) : agent.activeQuestion ? (
-            <QuestionPicker
-              question={agent.activeQuestion}
-              onSubmit={agent.answerQuestion}
-              onCancel={agent.cancel}
-            />
+          {local.picker ? (
+            <CommandPicker request={local.picker} onClose={() => local.setPicker(null)} onError={agent.addSystemEvent} />
+          ) : agent.activeQuestion && !questionCommands ? (
+            <Box flexDirection="column">
+              <QuestionPicker
+                question={agent.activeQuestion}
+                onSubmit={agent.answerQuestion}
+                onCancel={() => setQuestionCommands(true)}
+              />
+              <Text color={PALETTE.text} dimColor>Esc opens commands without discarding this question. /answer returns to the question.</Text>
+            </Box>
           ) : (
-            <Prompt
+            <Prompt hideStatus
               runState={agent.runState}
               onSubmit={handleSubmit}
               activeAgent={agent.activeAgent}
               assistantId={agent.assistantId}
               queuedMessage={agent.queuedMessage}
               onEditQueue={agent.enqueue}
+              clearDraftToken={clearDraftToken}
+              onDraftChange={draftChanged}
+              connectionStatus={connection}
+              onModalChange={setComposerModal}
             />
           )}
+          <Box flexDirection="column" marginTop={1}>
+            {blue.status === "connected" || blue.unreadCount > 0 ? (
+              <Text color={PALETTE.text} dimColor wrap="truncate-end">
+                Blue · collector {blue.collectorStatus} · AI {blue.aiStatus} · unread {blue.unreadCount} · /alerts
+              </Text>
+            ) : null}
+            {footer}
+            {agent.queuedMessages.length > 0 && <Text color={PALETTE.text} dimColor>{agent.queuedMessages.length} waiting · /queue to edit or remove</Text>}
+          </Box>
         </Box>
 
       </Box>
     </ScreenProvider>
-  );
-}
-
-// ── Transcript View ───────────────────────────────────────────────
-
-// ── Transcript helpers (Static-only rendering) ──────────────────
-
-function TranscriptSessionHeader({ session }: { session: SubAgentSession }) {
-  const color = AGENT_COLORS[session.agent] ?? "white";
-  const headerDesc = session.description.split("\n")[0] ?? session.description;
-
-  return (
-    <Box flexDirection="column" marginTop={1}>
-      <Text>
-        <Text color="gray">{`${GLYPH_DOT} `}</Text>
-        <Text bold color={color}>
-          {session.agent.charAt(0).toUpperCase() + session.agent.slice(1)}
-        </Text>
-        <Text dimColor italic>{`(${headerDesc})`}</Text>
-      </Text>
-      <Text dimColor>{`  ${GLYPH_HOOK}  Prompt:`}</Text>
-      {session.description.split("\n").map((line: string, i: number) => (
-        <Text key={`p${i}`} dimColor wrap="wrap">
-          {`       ${line}`}
-        </Text>
-      ))}
-    </Box>
-  );
-}
-
-function TranscriptSessionFooter({ session }: { session: SubAgentSession }) {
-  const elapsed = formatDuration((session.endTime ?? Date.now()) - session.startTime);
-  const toolText = `${session.toolCount} tool use${session.toolCount !== 1 ? "s" : ""}`;
-  const dotColor = session.status === "error" ? "red" : "green";
-
-  return (
-    <Box flexDirection="column">
-      <Text>
-        <Text color={dotColor}>{`${GLYPH_DOT} `}</Text>
-        <Text dimColor>{`Done (${toolText}${GLYPH_SEP}${elapsed})`}</Text>
-      </Text>
-    </Box>
-  );
-}
-
-/** Live-ticking footer for running sessions — the ONLY dynamic element. */
-function RunningSessionFooter({ session }: { session: SubAgentSession }) {
-  const [now, setNow] = React.useState(Date.now());
-  React.useEffect(() => {
-    const interval = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const elapsed = formatDuration(now - session.startTime);
-  const toolText = `${session.toolCount} tool use${session.toolCount !== 1 ? "s" : ""}`;
-  const color = AGENT_COLORS[session.agent] ?? "white";
-
-  return (
-    <Text dimColor italic>
-      {"  "}{GLYPH_HOOK}{"  "}
-      <Text color={color}>
-        {session.agent.charAt(0).toUpperCase() + session.agent.slice(1)}
-      </Text>
-      {` running (${toolText}${GLYPH_SEP}${elapsed})`}
-    </Text>
-  );
-}
-
-// ── Transcript View ───────────────────────────────────────────────
-
-function TranscriptView({
-  events,
-  sessions,
-}: {
-  events: AgentEvent[];
-  sessions: ReturnType<typeof useSubAgentSessions>;
-}) {
-  // Lookup maps
-  const sessionEventIds = useMemo(
-    () => new Set(sessions.flatMap((s) => s.eventIds)),
-    [sessions],
-  );
-  const sessionByStartId = useMemo(() => {
-    const map = new Map<string, (typeof sessions)[number]>();
-    for (const s of sessions) map.set(s.startEventId, s);
-    return map;
-  }, [sessions]);
-  const sessionByEndId = useMemo(() => {
-    const map = new Map<string, (typeof sessions)[number]>();
-    for (const s of sessions) {
-      if (s.endEventId) map.set(s.endEventId, s);
-    }
-    return map;
-  }, [sessions]);
-
-  const runningSessions = useMemo(
-    () => sessions.filter((s) => s.status === "running"),
-    [sessions],
-  );
-
-  // ALL events → Static items (append-only, no scroll disruption)
-  const staticItems = useMemo(() => {
-    type Item =
-      | { id: string; kind: "header" }
-      | { id: string; kind: "event"; event: AgentEvent }
-      | { id: string; kind: "session-header"; session: SubAgentSession }
-      | { id: string; kind: "session-event"; event: AgentEvent }
-      | { id: string; kind: "session-footer"; session: SubAgentSession };
-
-    const items: Item[] = [{ id: "__transcript-header__", kind: "header" }];
-
-    for (const event of events) {
-      // Session start → header
-      const startedSession = sessionByStartId.get(event.id);
-      if (startedSession) {
-        items.push({ id: `sh-${startedSession.id}`, kind: "session-header", session: startedSession });
-        continue;
-      }
-
-      // Session end → footer
-      const endedSession = sessionByEndId.get(event.id);
-      if (endedSession) {
-        items.push({ id: `sf-${endedSession.id}`, kind: "session-footer", session: endedSession });
-        continue;
-      }
-
-      // Inner session event (skip raw subagent_start/end)
-      if (sessionEventIds.has(event.id)) {
-        if (event.type === "subagent_start" || event.type === "subagent_end") continue;
-        items.push({ id: event.id, kind: "session-event", event });
-        continue;
-      }
-
-      // Regular event
-      items.push({ id: event.id, kind: "event", event });
-    }
-    return items;
-  }, [events, sessions, sessionEventIds, sessionByStartId, sessionByEndId]);
-
-  return (
-    <Box flexDirection="column">
-      <Static items={staticItems}>
-        {(item) => (
-          <Box key={item.id}>
-            {item.kind === "header" ? (
-              <Box marginBottom={1}>
-                <Text bold inverse>{" TRANSCRIPT "}</Text>
-                <Text dimColor>{" ctrl+o or Esc to close"}</Text>
-              </Box>
-            ) : item.kind === "session-header" ? (
-              <TranscriptSessionHeader session={item.session} />
-            ) : item.kind === "session-footer" ? (
-              <TranscriptSessionFooter session={item.session} />
-            ) : item.kind === "session-event" ? (
-              <Box marginLeft={3}>
-                <SubAgentProvider value={true}>
-                  <EventItem event={item.event} />
-                </SubAgentProvider>
-              </Box>
-            ) : (
-              <EventItem event={item.event} />
-            )}
-          </Box>
-        )}
-      </Static>
-
-      {/* Minimal dynamic region: only live-ticking footers for running sessions */}
-      {runningSessions.map((s) => (
-        <RunningSessionFooter key={s.id} session={s} />
-      ))}
-    </Box>
   );
 }

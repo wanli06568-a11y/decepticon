@@ -1,21 +1,31 @@
 """Structural quality check for a canonical finding before reporting completes."""
 
-from __future__ import annotations
+# Deliberately no `from __future__ import annotations`: it stringifies the
+# `ToolRuntime` annotation on `check_finding_report` below, and langchain's
+# injected-argument detection reads the raw signature rather than resolving
+# type hints. With a stringified annotation `runtime` is not recognised as an
+# injected argument, so it is validated as a model-supplied argument instead
+# of being passed through on the injection path.
 
 import json
 import re
 from collections.abc import Callable
 from typing import Any
+from uuid import UUID
 
 import yaml
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool, tool
 
 from decepticon.middleware.filesystem import EngagementFilesystemBackend
-from decepticon.tools.reporting.cvss import CVSSError, base_score, parse_vector
-from decepticon.tools.reporting.evidence_contract import _FrontmatterLoader, evidence_path
+from decepticon.tools.reporting.cvss import CVSSError, base_score, parse_vector, severity_band
 
-_FINDING_PATH = re.compile(r"^findings/(FIND-\d{3,})\.md$")
+from .evidence_contract import _FrontmatterLoader, evidence_path
+
+_FINDING_PATH = re.compile(r"^findings/(FIND-\d{2,})\.md$")
+_READABLE_PATH = re.compile(
+    r"^findings/(critical|high|medium|low)_(\d{2,})_([a-z0-9]+(?:-[a-z0-9]+)*)\.md$"
+)
 _VERDICTS = {"verified", "false_positive", "unverified"}
 _KINDS = {"vulnerability", "negative_result", "observation", "hypothesis"}
 
@@ -26,8 +36,11 @@ def check_finding_content(
     """Check machine-verifiable report invariants; never judge exploit truth."""
     errors: list[str] = []
     match = _FINDING_PATH.fullmatch(path)
-    if match is None:
-        return ["path must be findings/FIND-NNN.md"]
+    readable = _READABLE_PATH.fullmatch(path)
+    if match is None and readable is None:
+        return [
+            "path must be findings/{severity}_{number}_{title}.md or legacy findings/FIND-NNN.md"
+        ]
     lines = content.splitlines()
     if not lines or lines[0] != "---":
         return ["finding must have YAML frontmatter"]
@@ -38,27 +51,36 @@ def check_finding_content(
         return [f"invalid YAML frontmatter: {exc}"]
     if not isinstance(metadata, dict):
         return ["frontmatter must be a mapping"]
-    if metadata.get("id") != match.group(1):
+    expected_id = match.group(1) if match else f"FIND-{readable.group(2)}" if readable else ""
+    if metadata.get("id") != expected_id:
         errors.append("id must match canonical filename")
+    if readable:
+        if metadata.get("severity") != readable.group(1):
+            errors.append("severity must match readable filename")
+        try:
+            UUID(str(metadata.get("document_uuid")))
+        except ValueError:
+            errors.append("readable finding requires a document_uuid")
     kind = metadata.get("result_kind", "vulnerability")
-    if kind not in _KINDS:
+    if not isinstance(kind, str) or kind not in _KINDS:
         errors.append("result_kind is invalid")
     verdict = metadata.get("verification_status")
-    if verdict not in _VERDICTS:
+    if not isinstance(verdict, str) or verdict not in _VERDICTS:
         errors.append("verification_status must be verified, false_positive or unverified")
     if (
         not isinstance(metadata.get("verification_rationale"), str)
         or not metadata["verification_rationale"].strip()
     ):
         errors.append("verification_rationale is required")
-    if metadata.get("report_status") not in {"draft", "complete"}:
+    report_status = metadata.get("report_status")
+    if not isinstance(report_status, str) or report_status not in {"draft", "complete"}:
         errors.append("report_status must be draft or complete")
     vector = metadata.get("cvss_vector")
     score = metadata.get("cvss_score")
     if kind != "vulnerability" or verdict == "false_positive":
         if score is not None or vector:
             errors.append("negative/false-positive result must not carry a CVSS score")
-    elif score is not None or vector:
+    elif score is not None or vector or (verdict == "verified" and report_status == "complete"):
         if (
             not isinstance(vector, str)
             or not vector.startswith("CVSS:3.1/")
@@ -74,6 +96,8 @@ def check_finding_content(
             else:
                 if score != expected or str(metadata.get("cvss_version")) != "3.1":
                     errors.append("CVSS score/version does not match the CVSS 3.1 vector")
+                if readable and str(metadata.get("severity")) != severity_band(expected).lower():
+                    errors.append("severity does not match computed CVSS score")
     paths: list[Any] = []
     if "evidence_pointer" in metadata:
         paths.append(metadata["evidence_pointer"])
@@ -108,7 +132,17 @@ def build_finding_quality_tool(backend: Any) -> BaseTool:
 
     @tool
     def check_finding_report(path: str, runtime: ToolRuntime) -> str:
-        """Check a canonical finding's verdict, CVSS math, sections and evidence paths."""
+        """Check a canonical finding's verdict, CVSS math, sections and evidence paths.
+
+        Args:
+            path: Engagement-relative canonical path, e.g.
+                ``findings/high_01_cross-tenant-read.md`` or a legacy
+                ``findings/FIND-001.md``. Do NOT use the
+                ``/workspace/...`` form other filesystem tools accept, and
+                do not include the engagement directory, a leading slash,
+                or ``..`` segments — this path is validated as-is and any
+                of those forms is rejected.
+        """
         scoped = EngagementFilesystemBackend(backend, runtime.state.get("workspace_path"))
         result = scoped.read(f"/workspace/{path}", limit=10_000)
         if result.error or result.file_data is None:

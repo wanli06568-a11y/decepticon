@@ -1,16 +1,18 @@
 package compose
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/config"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/opscontrol"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/runtime"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/config"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/infracontrol"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/runtime"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/ui"
 )
 
 // Compose wraps Docker Compose commands for Decepticon services.
@@ -18,6 +20,8 @@ type Compose struct {
 	Home        string
 	ComposeFile string
 	EnvFile     string
+	OverlayFile string
+	ExtraEnv    []string
 	// Runtime is the container runtime selected at construction time
 	// (docker / podman / nerdctl). Stored so every call uses the same
 	// binary + socket and we don't re-probe on every invocation.
@@ -101,8 +105,11 @@ func (c *Compose) baseArgs() []string {
 	// normal flows but breaks the moment any caller passes a different
 	// `-p` (CI, manual debugging, …) and produces a "container_name in
 	// use by another project" conflict on the next ops_start.
-	args = append(args, "-p", opscontrol.ComposeProjectName())
+	args = append(args, "-p", infracontrol.ComposeProjectName())
 	args = append(args, "-f", c.ComposeFile, "--env-file", c.EnvFile)
+	if c.OverlayFile != "" {
+		args = append(args, "-f", c.OverlayFile)
+	}
 	// ADR-0006 Sprint 1: include the opscontrol overlay only when
 	// the file exists AND the host socket has been bound. Attaching
 	// the overlay without DECEPTICON_OPSCONTROL_SOCK_HOST exported
@@ -143,7 +150,7 @@ func ContainerName(svc string) string {
 // readVersion returns the installed version from $DECEPTICON_HOME/.version,
 // or an empty string if the file is missing or unreadable. The launcher
 // (install + explicit update) is the single writer; compose falls back to
-// :stable (the conservative default channel tag) when the marker is absent.
+// :latest (the default channel tag) when the marker is absent.
 func (c *Compose) readVersion() string {
 	data, err := os.ReadFile(filepath.Join(c.Home, ".version"))
 	if err != nil {
@@ -156,15 +163,15 @@ func (c *Compose) readVersion() string {
 // from the .version file plus any runtime-derived env (DOCKER_HOST for
 // Podman, etc.). docker compose treats the process environment as
 // higher precedence than --env-file, so this overrides any stale value the
-// user may have written into .env and avoids the silent `:stable` drift
+// user may have written into .env and avoids the silent `:latest` drift
 // that occurs when the variable is unset.
 func (c *Compose) composeEnv() []string {
 	// Single source of truth for compose interpolation env (STACK_NAME +
 	// COMPOSE_PROJECT). The daemon's DockerComposeBackend reads from the
 	// same helper so the two never write DIFFERENT container_name
 	// values into the SAME compose project. See
-	// opscontrol.ComposeCommandEnv() for the rationale.
-	env := opscontrol.ComposeCommandEnv()
+	// infracontrol.ComposeCommandEnv() for the rationale.
+	env := infracontrol.ComposeCommandEnv()
 	if v := c.readVersion(); v != "" {
 		env = append(env, "DECEPTICON_VERSION="+imageTag(v))
 	}
@@ -172,21 +179,29 @@ func (c *Compose) composeEnv() []string {
 	// containers (testcontainers, kubectl-with-docker-shim) find the
 	// Podman socket. No-op for Docker.
 	env = c.Runtime.Apply(env)
-	return env
+	return append(env, c.ExtraEnv...)
 }
 
 // run executes a compose command via the detected runtime.
 func (c *Compose) run(args []string, interactive bool) error {
+	if interactive {
+		return c.runWithStderr(args, interactive, os.Stderr)
+	}
+	return c.runWithStderr(args, false, ui.NeutralWriter{Writer: os.Stderr})
+}
+
+func (c *Compose) runWithStderr(args []string, interactive bool, stderr io.Writer) error {
 	cmdArgs := append(c.baseArgs(), args...)
 	cmd := exec.Command(c.Runtime.Bin, cmdArgs...)
 	cmd.Env = c.composeEnv()
 	if interactive {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stderr = stderr
 	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Env = append(cmd.Env, "COMPOSE_ANSI=never")
+		cmd.Stdout = ui.NeutralWriter{Writer: os.Stdout}
+		cmd.Stderr = stderr
 	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s compose %s: %w", c.Runtime.Name, strings.Join(args, " "), err)
@@ -209,22 +224,23 @@ func (c *Compose) Up(profiles ...string) error {
 		args = append(args, "--profile", p)
 	}
 	args = append(args, "up", "-d", "--no-build", "--wait", "--wait-timeout", startupTimeoutSeconds())
-	return c.run(args, false)
+	return c.upWithNetworkRecovery(args)
 }
 
 func (c *Compose) UpDatabases() error {
-	return c.run([]string{"up", "-d", "--no-build", "--wait", "--wait-timeout", startupTimeoutSeconds(), "postgres", "neo4j"}, false)
+	return c.upWithNetworkRecovery([]string{"up", "-d", "--no-build", "--wait", "--wait-timeout", startupTimeoutSeconds(), "postgres", "neo4j"})
+}
+
+// Desktop owns its UI and terminal. Start only the agent services and their
+// Compose dependencies; the web dashboard and interactive CLI are unnecessary.
+func (c *Compose) UpDesktop() error {
+	return c.upWithNetworkRecovery([]string{"up", "-d", "--no-build", "--wait", "--wait-timeout", startupTimeoutSeconds(), "langgraph", "skillogy"})
 }
 
 // startupTimeoutSeconds returns the --wait-timeout value as a string.
 // User override via DECEPTICON_STARTUP_TIMEOUT_SECONDS; falls back to 600s.
 func startupTimeoutSeconds() string {
-	if v := os.Getenv("DECEPTICON_STARTUP_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return strconv.Itoa(n)
-		}
-	}
-	return "600"
+	return config.StartupTimeoutSeconds()
 }
 
 // Down stops and removes containers using all profiles for clean teardown.
@@ -368,4 +384,21 @@ func (c *Compose) RemoveOrphanedCLI() {
 		rm.Env = c.composeEnv()
 		_ = rm.Run()
 	}
+}
+
+// ExecCapture runs a command inside a running service and returns its
+// stdout, for read-only diagnostics (`doctor --deep`). Unlike Exec it
+// captures instead of streaming. A non-zero exit returns both the captured
+// output and the error: a diagnostics module that exits 1 still printed its
+// JSON report, and callers may want to fold it.
+func (c *Compose) ExecCapture(ctx context.Context, service string, command ...string) ([]byte, error) {
+	cmdArgs := append(c.baseArgs(), "exec", "-T", service)
+	cmdArgs = append(cmdArgs, command...)
+	cmd := exec.CommandContext(ctx, c.Runtime.Bin, cmdArgs...)
+	cmd.Env = c.composeEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return out, fmt.Errorf("%s compose exec %s: %w", c.Runtime.Name, service, err)
+	}
+	return out, nil
 }

@@ -140,14 +140,26 @@ def _iter_override_bundles(role: str) -> Iterator[PluginBundle]:
 def resolve_role_model(role: str) -> str | None:
     """Composed override for a role's PRIMARY model.
 
-    Precedence: ``DECEPTICON_MODEL_<ROLE>`` (operator env) beats a
-    ``PluginBundle.models`` entry (plugin), which beats the tier default
+    Precedence: ``DECEPTICON_DESKTOP_MODEL`` for Desktop Local, then
+    ``DECEPTICON_MODEL_<ROLE>`` (operator env), then a
+    ``PluginBundle.models`` entry (plugin), then the tier default
     (returned as ``None`` here — the factory keeps the default when this
     yields nothing). This is the model analogue of ``build_middleware`` /
     ``build_tools``: it lets a plugin re-tier one agent by composition
     rather than editing the OSS tier map. Returns the winning model id
     or ``None`` when neither an env nor a bundle override is set.
     """
+    from decepticon.desktop_policy import read_desktop_policy
+
+    policy = read_desktop_policy()
+    if policy is not None:
+        return policy.selection(role).model
+    # Desktop Local selects one model for this invocation.  The proxy's
+    # DECEPTICON_MODEL route alone does not change the framework's per-role
+    # assignments, so apply the selection at the factory boundary too.
+    desktop_model = os.environ.get("DECEPTICON_DESKTOP_MODEL", "").strip()
+    if desktop_model:
+        return desktop_model
     env = os.environ.get(f"DECEPTICON_MODEL_{role.upper()}", "").strip()
     if env:
         return env
@@ -361,7 +373,7 @@ def build_middleware(
         llm: bound language model for summarization + per-slot use.
         fallback_models: list passed to ``ModelFallbackMiddleware``;
             empty / None skips the MODEL_FALLBACK slot.
-        sandbox: the underlying ``HTTPSandbox`` instance — required for
+        sandbox: the underlying ``HTTPTransportSandbox`` instance — required for
             the SANDBOX_NOTIFICATION slot if the role uses it.
         subagents: list of ``CompiledSubAgent`` instances for the
             SUBAGENT slot (orchestrators only).
@@ -418,7 +430,29 @@ def build_middleware(
     }
     factories.update(resolved.middleware_replace)
 
+    from decepticon.middleware.search_runtime import get_search_middleware
+    from decepticon.middleware.workflow import WorkflowMiddleware
+
     result: list = []
+    search_middleware = get_search_middleware(role=role, backend=backend)
+    workflow_role = "decepticon" if search_middleware else role
+    # The optional legacy plugin bundle supplies its own prompts and task
+    # contract. Injecting the default Red workflow into those agents gives
+    # them an unrelated OPPLAN/search policy, especially with v2 defaults.
+    legacy_plugin_roles = {
+        "vulnresearch",
+        "detector",
+        "verifier",
+        "patcher",
+        "scanner",
+        "exploiter",
+    }
+    if (
+        workflow_role in SLOTS_PER_ROLE
+        and workflow_role not in {"soundwave", "autohunt", "blue_cell"} | legacy_plugin_roles
+    ):
+        result.append(WorkflowMiddleware(role=workflow_role))
+    result.extend(search_middleware)
     for slot in MiddlewareSlot:  # canonical enum order
         if slot not in role_slots:
             continue
@@ -485,6 +519,22 @@ def build_tools(
         base = dict(standard_tools)
     else:
         base = {_tool_name(t): t for t in standard_tools}
+
+    from decepticon.desktop_policy import read_desktop_policy
+    from decepticon.desktop_tools import policy_tools
+
+    if read_desktop_policy() is not None:
+        _check_safety_gate(
+            role=role,
+            mw_replace={},
+            mw_disable=frozenset(),
+            tool_replace=overrides or {},
+            tool_disable=frozenset(disabled_tools or ()),
+        )
+        for name in disabled_tools or ():
+            base.pop(name, None)
+        base.update(overrides or {})
+        return [*base.values(), *policy_tools(role)]
 
     resolved = _resolve_overrides(
         role=role,

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -34,7 +35,7 @@ from typing import Any
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
 from deepagents.middleware.summarization import create_summarization_middleware
-from langchain.agents.middleware import AgentMiddleware, ModelFallbackMiddleware
+from langchain.agents.middleware import AgentMiddleware
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from decepticon.agents._benchmark_mode import benchmark_skill_sources
@@ -170,7 +171,7 @@ def _make_subagent(*, backend: Any, subagents: list | None = None, role: str = "
     if role == "decepticon":
         from decepticon.middleware.opplan_dispatch import planned_task_tool
 
-        m.tools = [planned_task_tool(m.tools[0])]
+        m.tools = [planned_task_tool(m.tools[0], backend=backend)]
     # Register the durable sub-agent transcript channel on the ORCHESTRATOR
     # state. ``AgentMiddleware.state_schema`` is the per-instance schema that
     # ``create_agent`` auto-merges into the compiled graph state at build time.
@@ -222,7 +223,7 @@ def _make_sandbox_notification(*, sandbox: Any = None, **_: Any):
     if sandbox is None:
         raise ValueError(
             "SandboxNotificationMiddleware requires a sandbox kwarg; "
-            "the agent factory must pass the HTTPSandbox instance it built."
+            "the agent factory must pass the HTTPTransportSandbox instance it built."
         )
     return SandboxNotificationMiddleware(sandbox=sandbox)
 
@@ -254,9 +255,13 @@ def _make_model_fallback(*, fallback_models: list | None = None, **_: Any):
     fallback simply skips the slot, mirroring the legacy
     ``if fallback_models: middleware.append(...)`` branch.
     """
-    if not fallback_models:
+    from decepticon.desktop_policy import read_desktop_policy
+
+    if read_desktop_policy() is not None or not fallback_models:
         return None
-    return ModelFallbackMiddleware(*fallback_models)
+    from decepticon.middleware.run_controls import VisibleModelFallbackMiddleware
+
+    return VisibleModelFallbackMiddleware(*fallback_models)
 
 
 class _SafeSummarizationProxy(AgentMiddleware):
@@ -301,34 +306,138 @@ class _SafeSummarizationProxy(AgentMiddleware):
         # stubs) has nothing to rebind — use the inner middleware as-is rather
         # than raising into the fallback below, which would silently drop
         # summarization for the turn.
+        from decepticon.middleware.run_controls import read_run_controls
+
+        controls = read_run_controls(request)
         model = getattr(request, "model", None)
-        if model is None or model is self._inner.model:
+        effort = (getattr(request, "model_settings", None) or {}).get("reasoning_effort")
+        if (
+            effort is None
+            and controls.autocompact == "auto"
+            and (model is None or model is self._inner.model)
+        ):
             return self._inner
         scoped_inner = copy.copy(self._inner)
         scoped_helper = copy.copy(self._inner._lc_helper)
-        scoped_helper.model = model
+        if model is not None:
+            if effort is not None and "reasoning_effort" in getattr(
+                type(model), "model_fields", {}
+            ):
+                model = model.model_copy(update={"reasoning_effort": effort})
+            scoped_helper.model = model
+        if isinstance(controls.autocompact, int):
+            trigger = ("tokens", controls.autocompact)
+            scoped_helper.trigger = trigger
+            scoped_helper._trigger_clauses = scoped_helper._normalize_trigger(trigger)
+            scoped_helper._trigger_conditions = scoped_helper._legacy_trigger_conditions(trigger)
+            scoped_helper.keep = ("tokens", max(256, controls.autocompact // 10))
         scoped_inner._lc_helper = scoped_helper
         return scoped_inner
 
-    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+    def _emit_compact_event(self, request: Any, event_type: str, detail: str) -> None:
+        """Emit a compaction event to the engagement event log.
+
+        Never crashes the agent — event log failures are swallowed so
+        summarization failures don't cascade (mirrors budget.py pattern).
+
+        Scope resolution mirrors ``EventLogMiddleware._resolve_scope``
+        (request.state -> ``DECEPTICON_ENGAGEMENT_ID`` -> default) and the
+        log is opened with :meth:`EventLog.for_workspace`, so these events
+        land in the same ``<workspace>/events.jsonl`` the dashboard,
+        shutdown.py and resume read — not an orphaned
+        ``engagements/<id>/events.jsonl`` no consumer opens.
+        """
+        from decepticon.middleware.run_controls import emit_custom_event
+
+        emit_custom_event(
+            "summarization_skipped"
+            if event_type == "compact.summarization_skipped"
+            else event_type,
+            {"detail": detail},
+        )
         try:
-            return self._scoped_inner(request).wrap_model_call(request, handler)
+            from decepticon.runtime.event_log import EventLog  # noqa: PLC0415
+            from decepticon.telemetry.sink import (  # noqa: PLC0415
+                reset_current_session,
+                session_id_for,
+                set_current_session,
+            )
+
+            state = getattr(request, "state", None) or {}
+            get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
+            engagement = (
+                get("engagement_name")
+                or get("engagement_id")
+                or os.environ.get("DECEPTICON_ENGAGEMENT_ID", "")
+                or "default-engagement"
+            )
+            workspace = (
+                get("workspace_path")
+                or os.environ.get("DECEPTICON_WORKSPACE_PATH", "")
+                or "/workspace"
+            )
+            event_log = EventLog.for_workspace(workspace, engagement)
+            token = set_current_session(session_id_for(engagement))
+            try:
+                event_log.append(event_type, {"detail": detail})
+            finally:
+                reset_current_session(token)
         except Exception:
+            logger.debug("compaction event emission failed (non-fatal)", exc_info=True)
+
+    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        self._emit_compact_event(request, "compact.start", "checking compaction threshold")
+        generation_started = False
+
+        def checked_handler(prepared: Any) -> Any:
+            nonlocal generation_started
+            generation_started = True
+            self._emit_compact_event(request, "compact.end", "context check complete")
+            return handler(prepared)
+
+        try:
+            return self._scoped_inner(request).wrap_model_call(request, checked_handler)
+        except Exception:
+            if generation_started:
+                # The main model failed, not the summarizer. Do not submit it
+                # again or misreport a policy/auth/provider failure as compaction.
+                raise
             logger.warning(
                 "Summarization middleware failed; skipping summarization "
                 "this turn and forwarding the original request.",
                 exc_info=True,
             )
+            self._emit_compact_event(
+                request,
+                "compact.summarization_skipped",
+                "summarization middleware failed — context not compacted this turn",
+            )
             return handler(request)
 
     async def awrap_model_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        self._emit_compact_event(request, "compact.start", "checking compaction threshold")
+        generation_started = False
+
+        async def checked_handler(prepared: Any) -> Any:
+            nonlocal generation_started
+            generation_started = True
+            self._emit_compact_event(request, "compact.end", "context check complete")
+            return await handler(prepared)
+
         try:
-            return await self._scoped_inner(request).awrap_model_call(request, handler)
+            return await self._scoped_inner(request).awrap_model_call(request, checked_handler)
         except Exception:
+            if generation_started:
+                raise
             logger.warning(
                 "Summarization middleware failed; skipping summarization "
                 "this turn and forwarding the original request.",
                 exc_info=True,
+            )
+            self._emit_compact_event(
+                request,
+                "compact.summarization_skipped",
+                "summarization middleware failed — context not compacted this turn",
             )
             return await handler(request)
 

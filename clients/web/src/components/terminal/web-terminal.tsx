@@ -16,8 +16,9 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import { cn } from "@/lib/utils";
+import { terminalWebSocketUrl } from "@/lib/browser-config";
+import { useBrowserConfig } from "@/lib/browser-config-context";
 
-const TERMINAL_WS_URL = process.env.NEXT_PUBLIC_TERMINAL_WS_URL ?? "ws://localhost:3003";
 const MAX_RECONNECT_DELAY = 4000;
 const INITIAL_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_ATTEMPTS = 15;
@@ -61,7 +62,10 @@ export function WebTerminal({
   threadId,
   className,
   onThreadId,
-}: WebTerminalProps) {
+}: WebTerminalProps): React.ReactNode {
+  const config = useBrowserConfig();
+  const terminalEndpointRef = useRef(config.terminalWsUrl);
+  terminalEndpointRef.current = config.terminalWsUrl;
   const containerRef = useRef<HTMLDivElement>(null);
   const [connState, setConnState] = useState<ConnectionState>("connecting");
 
@@ -88,6 +92,7 @@ export function WebTerminal({
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const disposedRef = useRef(false);
+  const initializationRef = useRef(0);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Track whether we've shown the reconnecting message (to avoid spam)
@@ -102,6 +107,7 @@ export function WebTerminal({
 
   const cleanup = useCallback(() => {
     disposedRef.current = true;
+    initializationRef.current++;
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
     retryListenerRef.current?.dispose();
@@ -138,19 +144,20 @@ export function WebTerminal({
     const targetValue = targetValueRef.current;
     const authorizationConfirmed = authorizationConfirmedRef.current;
 
-    let wsUrl =
-      `${TERMINAL_WS_URL}?engagementId=${encodeURIComponent(eid)}` +
-      `&engagementSlug=${encodeURIComponent(slug)}` +
-      `&agentId=${encodeURIComponent(aid)}` +
-      `&targetType=${encodeURIComponent(targetType)}` +
-      `&targetValue=${encodeURIComponent(targetValue)}` +
-      `&authorizationConfirmed=${authorizationConfirmed}`;
-    if (tid) wsUrl += `&threadId=${encodeURIComponent(tid)}`;
+    const wsUrl = terminalWebSocketUrl(window.location, terminalEndpointRef.current);
+    wsUrl.searchParams.set("engagementId", eid);
+    wsUrl.searchParams.set("engagementSlug", slug);
+    wsUrl.searchParams.set("agentId", aid);
+    wsUrl.searchParams.set("targetType", targetType);
+    wsUrl.searchParams.set("targetValue", targetValue);
+    wsUrl.searchParams.set("authorizationConfirmed", String(authorizationConfirmed));
+    if (tid) wsUrl.searchParams.set("threadId", tid);
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (disposedRef.current || wsRef.current !== ws) return;
       setConnState("connected");
       reconnectAttemptRef.current = 0;
       reconnectMsgShownRef.current = false;
@@ -162,6 +169,7 @@ export function WebTerminal({
     };
 
     ws.onmessage = (event) => {
+      if (disposedRef.current || wsRef.current !== ws) return;
       awaitingPongRef.current = false;
       const data = typeof event.data === "string" ? event.data : "";
       if (data.startsWith("{")) {
@@ -189,7 +197,7 @@ export function WebTerminal({
     };
 
     ws.onclose = (ev) => {
-      if (disposedRef.current) return;
+      if (disposedRef.current || wsRef.current !== ws) return;
 
       if (ev.code === 4001) {
         // Server handed this session to another connection (e.g. a second tab).
@@ -218,7 +226,7 @@ export function WebTerminal({
     };
 
     ws.onerror = () => {
-      if (disposedRef.current) return;
+      if (disposedRef.current || wsRef.current !== ws) return;
       // onerror always fires before onclose — just update the indicator
       setConnState("reconnecting");
     };
@@ -271,6 +279,7 @@ export function WebTerminal({
 
   // Initialize terminal + first connection
   const init = useCallback(async () => {
+    const generation = initializationRef.current;
     const container = containerRef.current;
     if (!container || disposedRef.current) return;
 
@@ -280,6 +289,8 @@ export function WebTerminal({
         import("@xterm/addon-fit"),
       ]);
       await import("xterm/css/xterm.css");
+
+      if (disposedRef.current || initializationRef.current !== generation || containerRef.current !== container) return;
 
       if (termRef.current) {
         // Already initialized — just reconnect WS

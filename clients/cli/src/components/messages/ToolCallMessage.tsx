@@ -6,7 +6,8 @@ import { TodoList, parseTodos } from "../TodoList.js";
 import { DiffResult } from "./DiffResult.js";
 import { useScreen } from "../shell/ScreenContext.js";
 import { CtrlOToExpand } from "../shell/CtrlOToExpand.js";
-import { GLYPH_DOT, GLYPH_HOOK } from "../../utils/theme.js";
+import { PALETTE, GLYPH_DOT, GLYPH_HOOK } from "../../utils/theme.js";
+import { parseUntrustedEnvelope } from "../../utils/untrusted.js";
 
 const MAX_LINES_PROMPT = 5;
 const MAX_LINES_TRANSCRIPT = 50;
@@ -52,21 +53,22 @@ function ToolCallHeader({
   status?: "success" | "error";
 }) {
   const label = TOOL_DISPLAY[toolName];
-  const dotColor = status === "error" ? "red" : "green";
+  const dotColor = status === "error" ? PALETTE.error : PALETTE.success;
 
   if (!label) {
     const argsStr = Object.entries(args)
       .filter(([, v]) => v != null && v !== "")
       .map(([k, v]) => {
-        const val = typeof v === "string" ? `"${v}"` : String(v);
+        const raw = typeof v === "string" ? JSON.stringify(v) : JSON.stringify(v) ?? String(v);
+        const val = raw.length > 240 ? raw.slice(0, 237) + "…" : raw;
         return `${k}=${val}`;
       })
-      .join(", ");
+      .join(", ").slice(0, 600);
     return (
-      <Text>
-        <Text color={dotColor}>{`${GLYPH_DOT} `}</Text>
-        <Text color="white" bold>{toolName}</Text>
-        <Text color="gray" italic>{` (${argsStr})`}</Text>
+      <Text color={PALETTE.text}>
+        <Text color={dotColor}>{`${status === "error" ? "✗" : GLYPH_DOT} `}</Text>
+        <Text color={PALETTE.text} bold>{toolName}</Text>
+        <Text color={PALETTE.muted} italic>{` (${argsStr})`}</Text>
       </Text>
     );
   }
@@ -122,11 +124,11 @@ function ToolCallHeader({
   }
 
   return (
-    <Text>
-      <Text color={dotColor}>{`${GLYPH_DOT} `}</Text>
-      <Text color="white" bold>{label}</Text>
-      {detail ? <Text color="gray" italic>{` (${detail})`}</Text> : null}
-      {detailDim ? <Text color="gray" italic>{detailDim}</Text> : null}
+    <Text color={PALETTE.text}>
+      <Text color={dotColor}>{`${status === "error" ? "✗" : GLYPH_DOT} `}</Text>
+      <Text color={PALETTE.text} bold>{label}</Text>
+      {detail ? <Text color={PALETTE.muted} italic>{` (${detail})`}</Text> : null}
+      {detailDim ? <Text color={PALETTE.muted} italic>{detailDim}</Text> : null}
     </Text>
   );
 }
@@ -140,12 +142,21 @@ function ResultContent({
   content: string;
   maxLines: number;
 }) {
-  const display = truncateLines(content, maxLines);
-  const wasTruncated = content.split("\n").length > maxLines;
+  // The untrusted-output envelope is for the model; render the inner content
+  // with a compact badge instead of the raw tags.
+  const envelope = parseUntrustedEnvelope(content);
+  const body = envelope ? envelope.inner : content;
+  const display = truncateLines(body, maxLines);
+  const wasTruncated = body.split("\n").length > maxLines;
   return (
     <>
+      {envelope && (
+        <Text color={PALETTE.muted}>
+          {"  ⚠ untrusted output"}{envelope.origin ? ` · ${envelope.origin}` : ""}{envelope.risk ? ` · risk=${envelope.risk}` : ""}
+        </Text>
+      )}
       {display.map((line, i) => (
-        <Text key={i} dimColor wrap="wrap">
+        <Text color={PALETTE.text} key={i} dimColor wrap="wrap">
           {i === 0 ? `  ${GLYPH_HOOK}  ` : "     "}{line}
         </Text>
       ))}
@@ -171,10 +182,10 @@ export const ToolCallMessage = React.memo(function ToolCallMessage({
   if (skillName) {
     return (
       <Box flexDirection="column" marginTop={1}>
-        <Text>
-          <Text color="green">{`${GLYPH_DOT} `}</Text>
-          <Text color="white" bold>{"Skill"}</Text>
-          <Text color="gray" italic>{` (${skillName})`}</Text>
+        <Text color={PALETTE.text}>
+          <Text color={PALETTE.success}>{`${GLYPH_DOT} `}</Text>
+          <Text color={PALETTE.text} bold>{"Skill"}</Text>
+          <Text color={PALETTE.muted} italic>{` (${skillName})`}</Text>
         </Text>
       </Box>
     );
@@ -201,13 +212,13 @@ export const ToolCallMessage = React.memo(function ToolCallMessage({
         : from;
     })();
     const label = event.toolName === "find_skill" ? "Find skill" : "Traverse skills";
-    const dotColor = event.status === "error" ? "red" : "green";
+    const dotColor = event.status === "error" ? PALETTE.error : PALETTE.success;
     return (
       <Box flexDirection="column" marginTop={1}>
-        <Text>
-          <Text color={dotColor}>{`${GLYPH_DOT} `}</Text>
-          <Text color="white" bold>{label}</Text>
-          {hint ? <Text color="gray" italic>{` (${hint})`}</Text> : null}
+        <Text color={PALETTE.text}>
+          <Text color={dotColor}>{`${event.status === "error" ? "✗" : GLYPH_DOT} `}</Text>
+          <Text color={PALETTE.text} bold>{label}</Text>
+          {hint ? <Text color={PALETTE.muted} italic>{` (${hint})`}</Text> : null}
         </Text>
       </Box>
     );

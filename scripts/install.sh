@@ -6,7 +6,7 @@
 #   curl -fsSL https://decepticon.red/install | bash
 #
 # Environment variables:
-#   CHANNEL              — Update channel (default: stable):
+#   CHANNEL              — Update channel (default: latest):
 #                            stable — newest final release baked >= SOAK days
 #                            latest — newest final release, immediately
 #   DECEPTICON_STABLE_SOAK_DAYS — stable soak window (default: 7)
@@ -22,15 +22,12 @@ REPO="BitterSecurity/Decepticon"
 BRANCH="${BRANCH:-main}"
 
 # Update channel (Claude-Code-style soak model; both are final-only):
-#   stable (default) — newest FINAL release baked >= STABLE_SOAK_DAYS
-#   latest           — newest FINAL release, immediately
-# Decepticon defaults to stable (conservative for a security tool); the
-# channel *semantics* match Claude Code, only the default differs.
-# Default + any unrecognized value resolves to stable.
-CHANNEL="$(printf '%s' "${CHANNEL:-stable}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+#   stable           — newest FINAL release baked >= STABLE_SOAK_DAYS
+#   latest (default) — newest FINAL release, immediately
+CHANNEL="$(printf '%s' "${CHANNEL:-latest}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 case "$CHANNEL" in
-    latest) ;;
-    *) CHANNEL="stable" ;;
+    stable) ;;
+    *) CHANNEL="latest" ;;
 esac
 # Days the stable channel waits before adopting a final release.
 STABLE_SOAK_DAYS="${DECEPTICON_STABLE_SOAK_DAYS:-7}"
@@ -153,7 +150,7 @@ assert_sha256() {
 # falls back to /releases/latest) when python3 is absent or none qualify.
 resolve_stable_soaked() {
     command -v python3 >/dev/null 2>&1 || return 0
-    curl -s "https://api.github.com/repos/$REPO/releases?per_page=30" | python3 -c '
+    curl -sSL "https://api.github.com/repos/$REPO/releases?per_page=30" | python3 -c '
 import sys, json, datetime
 try:
     soak = float(sys.argv[1])
@@ -192,7 +189,8 @@ print(best or "")
 
 resolve_version() {
     if [[ -n "${VERSION:-}" ]]; then
-        DECEPTICON_VERSION="$VERSION"
+        DECEPTICON_VERSION="${VERSION#v}"
+        RAW_BASE="https://raw.githubusercontent.com/$REPO/v$DECEPTICON_VERSION"
         return
     fi
 
@@ -206,7 +204,7 @@ resolve_version() {
         # latest channel, OR stable with nothing soaked / no python3 —
         # fall back to GitHub "latest" (newest final, excludes pre-releases).
         [[ "$CHANNEL" == "latest" ]] && info "Fetching latest version (newest final)..."
-        resolved=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" \
+        resolved=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" \
             | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
     fi
 
@@ -250,8 +248,8 @@ download_files() {
         info ".env already exists, preserving your configuration."
     else
         info "No .env yet — run 'decepticon onboard' to create one."
-        if [[ "$CHANNEL" == "latest" ]]; then
-            info "After onboarding, set DECEPTICON_CHANNEL=latest in .env to keep tracking the latest channel."
+        if [[ "$CHANNEL" == "stable" ]]; then
+            info "After onboarding, set DECEPTICON_CHANNEL=stable in .env to keep tracking the stable channel."
         fi
     fi
 
@@ -342,7 +340,7 @@ create_launcher() {
         error "Could not resolve a release version automatically."
         error "Set VERSION explicitly with a tag from:"
         error "  https://github.com/$REPO/releases"
-        error "Example: VERSION=<x.y.z> curl -fsSL https://decepticon.red/install | bash"
+        error "Example: curl -fsSL https://decepticon.red/install | VERSION=1.2.3 bash"
         exit 1
     fi
 

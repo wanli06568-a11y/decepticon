@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/compose"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/config"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/ui"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/updater"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/compose"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/config"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/ui"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/updater"
 	"github.com/spf13/cobra"
 )
 
@@ -19,12 +19,27 @@ var (
 var updateCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Check for updates and apply them",
-	RunE:  runUpdate,
+	Long: `Check GitHub for a newer Decepticon release and apply it.
+
+Applies the new launcher binary, re-syncs configuration files
+(docker-compose.yml, litellm config, etc.) and pulls updated Docker
+images. With --force it refreshes configuration files and Docker
+images even when the version is unchanged.
+
+The channel defaults to DECEPTICON_CHANNEL in .env (falling back to
+latest); --channel overrides it for this run only. Set AUTO_UPDATE in
+~/.decepticon/.env or use --no-update to control the launch-time
+update check.`,
+	Example: `  decepticon update                Check for updates and apply them
+  decepticon update --force        Re-sync config files and Docker images
+  decepticon update --channel stable
+                                   Track the stable (soaked) channel for this run`,
+	RunE: runUpdate,
 }
 
 func init() {
 	updateCmd.Flags().BoolVarP(&forceUpdate, "force", "f", false, "Refresh config files and Docker images even if version unchanged")
-	updateCmd.Flags().StringVar(&updateChannel, "channel", "", "Update channel for this run: stable (soaked final) or latest (newest final). Default: DECEPTICON_CHANNEL in .env, else stable")
+	updateCmd.Flags().StringVar(&updateChannel, "channel", "", "Update channel for this run: stable (soaked final) or latest (newest final). Default: DECEPTICON_CHANNEL in .env, else latest")
 	rootCmd.AddCommand(updateCmd)
 }
 

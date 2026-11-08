@@ -27,11 +27,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, cast
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.config import get_config
 from langgraph.types import Command
@@ -40,7 +42,42 @@ from typing_extensions import override
 from decepticon.middleware.opplan import _reduce_engagement_name, _reduce_workspace_path
 from decepticon.middleware.state_reducers import reduce_converging_value
 from decepticon.tools.bash.bash import bash_workspace
-from decepticon_core.utils.engagement_scope import set_active_engagement
+from decepticon.tools.browser import native_startup
+from decepticon_core.utils.engagement_scope import (
+    is_valid_engagement_label,
+    reset_active_engagement,
+    set_active_engagement,
+)
+
+_REPORT_SCOPE_TOOLS = frozenset(
+    {
+        "report_hackerone",
+        "report_bugcrowd_csv",
+        "report_executive",
+        "report_timeline",
+        "report_sarif",
+    }
+)
+
+
+class ReportingScopeError(ValueError):
+    """Trusted report state and explicit run configuration disagree."""
+
+
+def _trusted_report_scope(request: Any) -> str:
+    state = request.state
+    if not isinstance(state, dict):
+        raise ReportingScopeError("trusted engagement state missing")
+    configurable = (request.runtime.config or {}).get("configurable", {})
+    if not isinstance(configurable, dict):
+        raise ReportingScopeError("run config invalid")
+    label = state.get("kg_engagement") or state.get("engagement_name")
+    if not isinstance(label, str) or label != label.strip() or not is_valid_engagement_label(label):
+        raise ReportingScopeError("trusted graph engagement label invalid")
+    for key in ("engagement_name", "kg_engagement", "workspace_path"):
+        if key in configurable and configurable[key] != state.get(key):
+            raise ReportingScopeError("run config and engagement state mismatch")
+    return label
 
 
 class EngagementContextState(AgentState):
@@ -139,13 +176,44 @@ def _configurable_from_runnable_config() -> dict[str, Any]:
     return configurable if isinstance(configurable, dict) else {}
 
 
+def _assert_runtime_binding(state: Any, configurable: dict[str, Any] | None = None) -> None:
+    """A launcher-scoped mount must not dispatch a sibling/stale engagement."""
+    active = os.environ.get("DECEPTICON_RUNTIME_ENGAGEMENT", "")
+    if not active:
+        return  # Shared-root Compose and native policy adapters retain their contract.
+    if not is_valid_engagement_label(active):
+        raise ValueError("Invalid launcher runtime engagement")
+    state = state if isinstance(state, dict) else {}
+    cfg = configurable if configurable is not None else _configurable_from_runnable_config()
+    if (state.get("engagement_name") or cfg.get("engagement_name")) != active:
+        raise ValueError("Session does not belong to the launcher runtime engagement")
+    for source in (state, cfg):
+        if source.get("engagement_name") and source["engagement_name"] != active:
+            raise ValueError("Session does not belong to the launcher runtime engagement")
+        path = source.get("workspace_path")
+        if path and path not in {"/workspace", f"/workspace/{active}"}:
+            raise ValueError("Session does not belong to the launcher runtime workspace")
+    if (
+        state.get("workspace_path")
+        and cfg.get("workspace_path")
+        and state["workspace_path"] != cfg["workspace_path"]
+    ):
+        raise ValueError("Checkpoint and run workspace mismatch")
+
+
+def _assert_request_binding(request: Any) -> None:
+    config = getattr(getattr(request, "runtime", None), "config", None)
+    cfg = config.get("configurable", {}) if isinstance(config, dict) else None
+    _assert_runtime_binding(request.state, cfg)
+
+
 def _hydrate_engagement_state(state: Any) -> dict[str, Any] | None:
     """Copy ``engagement_name``/``workspace_path`` from runnable config into state.
 
     Runs in ``before_agent`` so the values are present on state before any
     downstream middleware (OPPLAN, filesystem) reads them. Idempotent: if the
-    state already carries either field, it is left untouched and the config
-    value is ignored.
+    state already carries either binding field, it is left untouched. Current
+    explicit authorization from the bound trusted caller is refreshed per run.
 
     Also propagates the engagement label into the per-context
     ``_active_engagement`` so KG writes through ``KGStore``
@@ -155,6 +223,7 @@ def _hydrate_engagement_state(state: Any) -> dict[str, Any] | None:
     """
     get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
     configurable = _configurable_from_runnable_config()
+    _assert_runtime_binding(state, configurable)
     updates: dict[str, Any] = {}
 
     engagement_label: str | None = get("engagement_name")
@@ -179,10 +248,12 @@ def _hydrate_engagement_state(state: Any) -> dict[str, Any] | None:
             value = configurable.get(field)
             if isinstance(value, str) and value:
                 updates[field] = value
-    if get("authorization_confirmed") is None:
-        confirmed = configurable.get("authorization_confirmed")
-        if isinstance(confirmed, bool):
-            updates["authorization_confirmed"] = confirmed
+    # Approval is current trusted launch context, not an immutable historical
+    # fact. A resumed checkpoint can predate approval (or its withdrawal).
+    # Binding is validated above; absent/non-boolean config never grants access.
+    confirmed = configurable.get("authorization_confirmed")
+    if isinstance(confirmed, bool) and get("authorization_confirmed") is not confirmed:
+        updates["authorization_confirmed"] = confirmed
 
     # KGMiddleware and the run launcher carry the authoritative composite
     # tenant+engagement graph partition in ``kg_engagement``. Keep the human /
@@ -248,6 +319,18 @@ def _build_autohunt_injection(
 ) -> str:
     """Render the trusted, single-target bootstrap context for Autohunt."""
     authorization = "confirmed" if authorization_confirmed else "NOT confirmed"
+    if target_type == "direct_scope":
+        return (
+            "\n\n[Direct engagement scope — current trusted launcher/client context]\n"
+            f"Declared primary target: {target_value}\n"
+            f"Authorization: {authorization}\n"
+            "The declared target is a display anchor, not an expansion of scope. "
+            "Use plan/roe.json for the complete operator-provisioned machine scope, "
+            "exclusions and authorized windows. Current trusted approval supersedes "
+            "historical assistant statements about approval; when confirmed, do not "
+            "ask the same authorization question again. Scope and tool gates still apply. "
+            "If NOT confirmed, ask one blocking question and wait; do not invent approval."
+        )
     return (
         "\n\n[Autohunt bootstrap context — set by the launcher/client]\n"
         f"Declared target: {target_value}\n"
@@ -389,6 +472,9 @@ class EngagementContextMiddleware(AgentMiddleware):
 
     @override
     async def abefore_agent(self, state, runtime) -> dict[str, Any] | None:
+        _assert_runtime_binding(state)
+        if native_startup.REGISTRATIONS_PATH.exists():
+            await native_startup.initialize_native_browser(get_config())
         return _hydrate_engagement_state(state)
 
     @override
@@ -400,7 +486,16 @@ class EngagementContextMiddleware(AgentMiddleware):
         return await handler(self._inject(request))
 
     @override
-    def wrap_tool_call(self, request, handler) -> ToolMessage | Command:
+    def wrap_tool_call(
+        self, request: ToolCallRequest, handler: Callable[[ToolCallRequest], ToolMessage | Command]
+    ) -> ToolMessage | Command:
+        _assert_request_binding(request)
+        if request.tool and request.tool.name in _REPORT_SCOPE_TOOLS:
+            token = set_active_engagement(_trusted_report_scope(request))
+            try:
+                return handler(request)
+            finally:
+                reset_active_engagement(token)
         if request.tool and request.tool.name in {
             "bash",
             "bash_output",
@@ -413,7 +508,18 @@ class EngagementContextMiddleware(AgentMiddleware):
         return handler(request)
 
     @override
-    async def awrap_tool_call(self, request, handler) -> ToolMessage | Command:
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
+    ) -> ToolMessage | Command:
+        _assert_request_binding(request)
+        if request.tool and request.tool.name in _REPORT_SCOPE_TOOLS:
+            token = set_active_engagement(_trusted_report_scope(request))
+            try:
+                return await handler(request)
+            finally:
+                reset_active_engagement(token)
         if request.tool and request.tool.name in {
             "bash",
             "bash_output",
@@ -426,6 +532,7 @@ class EngagementContextMiddleware(AgentMiddleware):
         return await handler(request)
 
     def _inject(self, request):
+        _assert_request_binding(request)
         state = request.state or {}
         get = state.get if hasattr(state, "get") else (lambda _k, _d=None: None)
 

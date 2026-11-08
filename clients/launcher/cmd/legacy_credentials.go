@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/compose"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/config"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/opscontrol"
-	"github.com/PurpleAILAB/Decepticon/clients/launcher/internal/ui"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/compose"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/config"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/infracontrol"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/ui"
 )
 
 const legacySaltMarker = "DECEPTICON_LEGACY_LITELLM_SALT"
@@ -69,7 +70,9 @@ func migrateLegacyCredentials(env map[string]string) error {
 	return migrateLegacyCredentialsWith(env, credentialDatabaseOps{
 		up: func() error {
 			c = compose.New()
-			return c.UpDatabases()
+			err := c.UpDatabases()
+			c.RefreshPorts(env)
+			return err
 		},
 		postgres: func(password string) error { return rotatePostgresPassword(c, password) },
 		neo4j:    rotateNeo4jPassword,
@@ -77,7 +80,7 @@ func migrateLegacyCredentials(env map[string]string) error {
 }
 
 func migrationCompletionPath(home string) string {
-	project := sha256.Sum256([]byte(opscontrol.ComposeProjectName()))
+	project := sha256.Sum256([]byte(infracontrol.ComposeProjectName()))
 	return filepath.Join(home, fmt.Sprintf(".credential-migration-%x.complete", project[:8]))
 }
 
@@ -92,7 +95,7 @@ func migrateLegacyCredentialsWith(env map[string]string, db credentialDatabaseOp
 			return err
 		}
 		previous, err := config.LoadEnv(config.EnvPath() + ".before-credential-migration")
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		if err != nil {
