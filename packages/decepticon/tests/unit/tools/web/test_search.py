@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 import pytest
 
-from decepticon.middleware.roe import GATED_TOOL_NAMES, NETWORK_TARGET_EXTRACTORS
 from decepticon.middleware.untrusted_output import UNTRUSTED_TOOL_NAMES
 from decepticon.tools.web import search
 
@@ -32,7 +31,7 @@ class _FakeSandbox:
 
 def _patch_sandbox(monkeypatch: pytest.MonkeyPatch, output: str) -> _FakeSandbox:
     fake = _FakeSandbox(output)
-    monkeypatch.setattr(search, "get_sandbox", lambda: fake)
+    monkeypatch.setattr(search, "get_sandbox", lambda config=None: fake)
     monkeypatch.setattr(search, "_workspace_path_from_config", lambda _c: "/workspace/eng1")
     return fake
 
@@ -76,7 +75,7 @@ async def test_web_fetch_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     # Assert the URL as an exact shlex token (== — not a URL substring test).
     cmd = fake.commands[0]
     argv = shlex.split(cmd)
-    assert "decepticon.sandbox_web fetch" in cmd
+    assert f"python3 -I -m {search.ENGINE_MODULE} fetch" in cmd
     assert any(a == "https://x.test/a" for a in argv)
     assert "--workspace" in cmd and "/workspace/eng1" in cmd
     assert "--selector" in cmd
@@ -104,7 +103,7 @@ async def test_web_fetch_scope_refusal_is_not_reported_as_login(
 
 
 async def test_web_fetch_no_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(search, "get_sandbox", lambda: None)
+    monkeypatch.setattr(search, "get_sandbox", lambda config=None: None)
     monkeypatch.setattr(search, "_workspace_path_from_config", lambda _c: "/workspace/eng1")
     out = await search.web_fetch.ainvoke({"url": "https://x.test/a"})
     assert "no sandbox" in out
@@ -134,7 +133,7 @@ async def test_web_search_hits(monkeypatch: pytest.MonkeyPatch) -> None:
     lines = [ln.strip() for ln in out.splitlines()]
     assert any(ln == "https://a.test" for ln in lines)
     assert any(ln == "https://b.test" for ln in lines)
-    assert "decepticon.sandbox_web search" in fake.commands[0]
+    assert f"python3 -I -m {search.ENGINE_MODULE} search" in fake.commands[0]
 
 
 async def test_web_search_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,18 +147,6 @@ async def test_web_search_provider_error(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 # --- middleware wiring -------------------------------------------------------
-
-
-def test_tools_are_roe_gated() -> None:
-    assert "web_fetch" in GATED_TOOL_NAMES
-    assert "web_search" in GATED_TOOL_NAMES
-
-
-def test_web_fetch_target_gated_web_search_exempt() -> None:
-    # web_fetch extracts the url host (target-gated)...
-    assert NETWORK_TARGET_EXTRACTORS["web_fetch"]({"url": "https://t.test/x"}) == ["t.test"]
-    # ...web_search is OSINT: no host extracted (target-exempt, still audited).
-    assert NETWORK_TARGET_EXTRACTORS["web_search"]({"query": "q"}) == []
 
 
 def test_tools_are_untrusted() -> None:

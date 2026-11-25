@@ -1,9 +1,14 @@
 # Extension contract: capabilities, skills, workflows and clients
 
-Desktop hosts may opt into the proposed [settings policy adapter](desktop-settings-policy.md).
-Its scope and tool approvals come from host-owned read-only custody, not graph
-input; absence of the opt-in preserves the existing client contract. Policy
-validation does not acknowledge runtime tool registration.
+A trusted library host may provision out-of-band authority (per-role model
+selection, approved external tools, dispatch observation) through the
+host-neutral [host integration seam](host-integration.md): the engine core
+consults a provider registered under the `decepticon.host_integration`
+entry-point group, and the null default preserves the existing client contract
+when no host is present. Scope and tool approvals come from host-owned
+read-only custody, not graph input; policy validation does not acknowledge
+runtime tool registration. A concrete host (e.g. the commercial Desktop app)
+ships its provider in its own plugin package, not in this engine.
 
 This is the current contributor entry point for extending agents, knowledge,
 business workflows and client adapters. It describes the source-tree contract;
@@ -93,6 +98,19 @@ Plan is optional and is entered
 explicitly; it is not an execution prerequisite. An operator provisions canonical
 `plan/roe.json`; Soundwave reads it and may draft a separate candidate but cannot
 rewrite it. The seven optional planning documents use that approved scope.
+Trusted library hosts may provide `planning_document_source=` to
+`create_soundwave_agent`. Its Python provider receives the current `ToolRuntime`
+and returns a read-only source with `read_document(filename) -> (bytes, revision)`,
+or `None` to preserve local completion. The native tool selects the eight fixed
+filenames, validates the existing schemas and scope, bounds each document to
+512 KiB, and rechecks bytes/revisions before emitting the review notification.
+The provider must authenticate and revalidate current actor/run authority on
+every read; failures are refused without a local-file fallback. This is a
+storage adapter, not a tool override or configuration-selected callable. Full
+`tools=` replacement and this argument cannot be combined. The ordinary
+safety-critical override guard remains enabled. A revision recheck is not an
+atomic multi-document snapshot or permission to execute; hosts must still
+review/capture the current documents and enforce their normal launch authority.
 Publication validates the eight-document bundle (RoE plus seven documents), emits
 `planning_draft_ready`, and leaves the operator in Plan. It neither changes
 scope authorization nor switches modes automatically. OPPLAN is created by the execution

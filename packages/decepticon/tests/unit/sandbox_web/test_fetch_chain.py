@@ -12,10 +12,9 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import pytest
-
-from decepticon.sandbox_web import fetch_chain
-from decepticon.sandbox_web.fetch_chain import fetch
-from decepticon.sandbox_web.validators import SMALL_BODY_THRESHOLD, Verdict
+from decepticon_sandbox.web import fetch_chain
+from decepticon_sandbox.web.fetch_chain import fetch
+from decepticon_sandbox.web.validators import SMALL_BODY_THRESHOLD, Verdict
 
 
 @dataclass
@@ -166,7 +165,7 @@ def test_to_dict_shape(monkeypatch: pytest.MonkeyPatch) -> None:
         "grid_exhausted",
         "stop_reason",
         "untried_routes",
-        "must_invoke_playwright_mcp",
+        "needs_agent_browser",
     }
     assert required <= set(d)
     assert "content" not in d

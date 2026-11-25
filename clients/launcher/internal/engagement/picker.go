@@ -1,12 +1,14 @@
 package engagement
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/inventory"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/ui"
 )
 
@@ -47,10 +50,11 @@ type Choice struct {
 // EngagementEntry pairs a slug with metadata used for picker rendering and
 // downstream assistant selection.
 type EngagementEntry struct {
-	Slug  string
-	Ready bool
-	Scope scopeSummary
-	mtime int64
+	Slug    string
+	Ready   bool
+	Started bool // run has begun → scope locked (draft while false)
+	Scope   scopeSummary
+	mtime   int64
 }
 
 // scopeSummary is what the picker shows per engagement: the first in-scope
@@ -119,6 +123,35 @@ func readMachineScopeFull(data []byte) (inCount, denyCount int, target string, o
 	return inCount, denyCount, target, inCount > 0
 }
 
+// readScopeTargets returns the engagement's in/out scope entries as plain
+// target strings, used to seed the draft-edit form.
+func readScopeTargets(root string) (in, out []string) {
+	data, err := os.ReadFile(filepath.Join(root, "plan", "roe.json"))
+	if err != nil {
+		return nil, nil
+	}
+	var doc struct {
+		MachineEnforcement *struct {
+			InScope    []json.RawMessage `json:"in_scope"`
+			OutOfScope []json.RawMessage `json:"out_of_scope"`
+		} `json:"machine_enforcement"`
+	}
+	if json.Unmarshal(data, &doc) != nil || doc.MachineEnforcement == nil {
+		return nil, nil
+	}
+	for _, raw := range doc.MachineEnforcement.InScope {
+		if t, ok := scopeEntryTarget(raw); ok {
+			in = append(in, t)
+		}
+	}
+	for _, raw := range doc.MachineEnforcement.OutOfScope {
+		if t, ok := scopeEntryTarget(raw); ok {
+			out = append(out, t)
+		}
+	}
+	return in, out
+}
+
 // scopeReady reports whether the engagement has an enforced machine scope.
 // Creation is the authorization — an engagement created with targets carries
 // a "plan/roe.json" machine block and needs no separate approval marker.
@@ -161,7 +194,7 @@ func ScanEngagements(home string) ([]EngagementEntry, error) {
 			continue
 		}
 		scope := readScopeSummary(filepath.Join(root, slug))
-		entry := EngagementEntry{Slug: slug, Ready: scope.Enforced, Scope: scope}
+		entry := EngagementEntry{Slug: slug, Ready: scope.Enforced, Started: IsStarted(filepath.Join(root, slug)), Scope: scope}
 		if entry.Ready {
 			if st, err := os.Stat(filepath.Join(root, slug, "plan", "roe.json")); err == nil {
 				entry.mtime = st.ModTime().Unix()
@@ -221,6 +254,7 @@ type pickerItem struct {
 	slug       string // empty for the "[+] New" sentinel
 	isNew      bool
 	ready      bool
+	started    bool // scope locked (draft when ready && !started)
 	inProgress bool
 	scope      scopeSummary
 }
@@ -239,7 +273,10 @@ func (i pickerItem) Title() string {
 	if i.inProgress {
 		return i.slug + "  (in progress)"
 	}
-	return i.slug
+	if !i.started {
+		return i.slug + "  (draft — scope editable)"
+	}
+	return i.slug + "  (locked)"
 }
 
 func (i pickerItem) Description() string {
@@ -249,8 +286,11 @@ func (i pickerItem) Description() string {
 	if i.inProgress {
 		return "No enforced scope: create with targets or import plan/roe.json"
 	}
-	description := fmt.Sprintf("Red ready · %d in scope · %d denied · %s", i.scope.InCount, i.scope.DenyCount, i.scope.Target)
-	return description
+	state := "draft — edit scope before starting"
+	if i.started {
+		state = "locked — scope immutable (new engagement for a different scope)"
+	}
+	return fmt.Sprintf("Red ready · %d in scope · %d denied · %s · %s", i.scope.InCount, i.scope.DenyCount, i.scope.Target, state)
 }
 
 type pickerKeyMap struct {
@@ -357,6 +397,7 @@ func buildItems(entries []EngagementEntry) []list.Item {
 		items = append(items, pickerItem{
 			slug:       e.Slug,
 			ready:      e.Ready,
+			started:    e.Started,
 			inProgress: !e.Ready,
 			scope:      e.Scope,
 		})
@@ -477,7 +518,18 @@ func (m pickerModel) View() tea.View {
 }
 
 // Select runs the engagement picker.
-func Select(home string) (Choice, error) {
+func Select(home, inventoryDSN string) (Choice, error) {
+	// Open the asset inventory best-effort: on a first run (stack not up yet)
+	// Open fails and inv stays nil, which every inventory method no-ops on, so
+	// the wizard falls back to live discovery only.
+	var inv *inventory.Store
+	if inventoryDSN != "" {
+		if s, err := inventory.Open(context.Background(), inventoryDSN); err == nil {
+			inv = s
+			defer inv.Close()
+		}
+	}
+
 	all, err := ScanEngagements(home)
 	if err != nil {
 		ui.Warning("Could not scan engagements: " + err.Error())
@@ -498,14 +550,41 @@ func Select(home string) (Choice, error) {
 	}
 
 	if final.chosen.isNew {
-		slug, lists, err := promptNewEngagement(home)
+		slug, lists, opts, err := promptNewEngagement(home, inv)
 		if err != nil {
 			return Choice{}, err
 		}
-		return createDirectEngagement(home, slug, lists, time.Now())
+		return createDirectEngagement(home, slug, lists, opts, time.Now())
 	}
 
-	return choiceForEngagement(home, final.chosen.slug), nil
+	slug := final.chosen.slug
+	// A draft (scope present, not yet started) may still be edited; starting
+	// the engagement locks it. Offer the edit before handing off.
+	if scopeReady(home, slug) && !IsStarted(filepath.Join(home, "workspace", slug)) {
+		var edit bool
+		confirm := huh.NewForm(
+			huh.NewGroup(
+				huh.NewConfirm().
+					Title("\""+slug+"\" is a draft — edit its scope before starting?").
+					Description("Starting the engagement locks the scope (a different scope then needs a new engagement). Edit to adjust in/out scope with passive suggestions, or Keep to start as-is.").
+					Affirmative("Edit").
+					Negative("Keep").
+					Value(&edit),
+			),
+		).WithTheme(huh.ThemeFunc(ui.DecepticonTheme))
+		// On non-interactive stdin the confirm errors → keep as-is (safe).
+		if err := confirm.Run(); err == nil && edit {
+			lists, opts, err := promptEditDraftScope(home, slug, inv)
+			if err != nil {
+				return Choice{}, err
+			}
+			if err := writeDraftScope(home, slug, lists, opts, time.Now()); err != nil {
+				return Choice{}, err
+			}
+		}
+	}
+
+	return choiceForEngagement(home, slug), nil
 }
 
 func ResolveExisting(home, slug string) (Choice, error) {
@@ -616,7 +695,7 @@ func promptScopeSuggestions(recommendations []string) (accepted []string, additi
 	return selected, additional, nil
 }
 
-func promptNewEngagement(home string) (string, scopeLists, error) {
+func promptNewEngagement(home string, inv *inventory.Store) (string, scopeLists, scopeOptions, error) {
 	var slug, targets, outOfScope string
 	form := huh.NewForm(
 		huh.NewGroup(
@@ -654,40 +733,62 @@ func promptNewEngagement(home string) (string, scopeLists, error) {
 		).Title("New engagement"),
 	).WithTheme(huh.ThemeFunc(ui.DecepticonTheme))
 	if err := form.Run(); err != nil {
-		return "", scopeLists{}, fmt.Errorf("engagement setup cancelled: %w", err)
+		return "", scopeLists{}, scopeOptions{}, fmt.Errorf("engagement setup cancelled: %w", err)
 	}
 	if err := validateSlug(home, slug); err != nil {
-		return "", scopeLists{}, err
+		return "", scopeLists{}, scopeOptions{}, err
 	}
+	lists, opts, err := collectScope(slug, targets, outOfScope, "Create", scopeOptions{}, inv)
+	if err != nil {
+		return "", scopeLists{}, scopeOptions{}, err
+	}
+	return slug, lists, opts, nil
+}
+
+// collectScope runs passive discovery + suggestions on the typed targets,
+// normalizes them to the enforced scope lists, collects the optional enforced
+// RoE controls (seeded for edit), and shows a preview/confirm gate. Shared by
+// create and draft-edit; verb is "Create" or "Save".
+func collectScope(slug, targets, outOfScope, verb string, seed scopeOptions, inv *inventory.Store) (scopeLists, scopeOptions, error) {
 	// The form's validators do not fire when stdin ends mid-form; re-verify the
 	// contract here so an EOF can never yield a scopeless engagement.
 	in, _, err := dedupeScopeTargets(splitScopeTargets([]string{targets}))
 	if err != nil {
-		return "", scopeLists{}, err
+		return scopeLists{}, scopeOptions{}, err
 	}
 	if len(in) == 0 {
-		return "", scopeLists{}, fmt.Errorf("engagement setup cancelled: no in-scope target entered")
+		return scopeLists{}, scopeOptions{}, fmt.Errorf("scope entry cancelled: no in-scope target entered")
 	}
 	if _, _, err := dedupeScopeTargets(splitScopeTargets([]string{outOfScope})); err != nil {
-		return "", scopeLists{}, err
+		return scopeLists{}, scopeOptions{}, err
 	}
 
 	// Passive discovery: CT logs + passive DNS suggest in-scope entries for
 	// the first hostname target. Strictly optional — the network never
-	// blocks creation; a timeout or degradation folds back to the typed
+	// blocks scope entry; a timeout or degradation folds back to the typed
 	// targets (the operator always owns what goes in scope).
 	if zone := discoveryZone(in); zone != "" {
+		// Reuse prior lookups for this zone from the asset inventory
+		// (best-effort; inv may be nil when the stack isn't up).
+		remembered, _ := inv.Lookup(context.Background(), zone)
+		if len(remembered) > 0 {
+			ui.Info(fmt.Sprintf("Reusing %d remembered asset(s) for %s from the inventory.", len(remembered), zone))
+		}
 		ui.Info(fmt.Sprintf("Checking passive scope suggestions (up to %s)...", scopeDiscoveryBudget))
 		discovery := DiscoverScope(zone, scopeDiscoveryBudget)
+		// Remember this run's live finds for future engagements (best-effort).
+		_ = inv.Record(context.Background(), zone, "passive", discovery.Recommended)
+		// Recommendations = remembered ∪ live finds (deduped, order preserved).
+		recommendations := mergeRecommendations(remembered, discovery.Recommended)
 		switch {
-		case len(discovery.Recommended) > 0 && len(discovery.Notes) > 0:
+		case len(recommendations) > 0 && len(discovery.Notes) > 0:
 			ui.Info(fmt.Sprintf("Some passive sources did not respond: %s. Review the available suggestions or enter scope manually.", strings.Join(discovery.Notes, "; ")))
-		case len(discovery.Recommended) == 0:
+		case len(recommendations) == 0:
 			ui.Info(fmt.Sprintf("Passive discovery found nothing: %s. Continuing with your typed targets.", strings.Join(discovery.Notes, "; ")))
 		default:
-			ui.Info(fmt.Sprintf("Passive discovery: %d suggestion(s) in the %s zone.", len(discovery.Recommended), zone))
+			ui.Info(fmt.Sprintf("Passive discovery: %d suggestion(s) in the %s zone.", len(recommendations), zone))
 		}
-		if accepted, additional, suggestErr := promptScopeSuggestions(discovery.Recommended); suggestErr == nil {
+		if accepted, additional, suggestErr := promptScopeSuggestions(recommendations); suggestErr == nil {
 			// A cancelled suggestion form counts as "skip suggestions" and
 			// keeps the typed targets — only accepted entries merge in.
 			if len(accepted) > 0 {
@@ -697,46 +798,174 @@ func promptNewEngagement(home string) (string, scopeLists, error) {
 				targets = strings.TrimSpace(targets + " " + extra)
 			}
 			if in, _, err = dedupeScopeTargets(splitScopeTargets([]string{targets})); err != nil {
-				return "", scopeLists{}, err
+				return scopeLists{}, scopeOptions{}, err
 			}
 		}
 	}
 
 	lists, err := buildScopeLists([]string{targets}, []string{outOfScope})
 	if err != nil {
-		return "", scopeLists{}, err
+		return scopeLists{}, scopeOptions{}, err
 	}
 
+	// Optional enforced controls (seeded for edit). Only fields the runtime
+	// actually enforces are offered.
+	opts, err := promptScopeOptions(seed)
+	if err != nil {
+		return scopeLists{}, scopeOptions{}, err
+	}
+
+	title := "Create this engagement?"
+	if verb == "Save" {
+		title = "Save scope changes?"
+	}
 	var confirmed bool
 	preview := huh.NewForm(
 		huh.NewGroup(
 			huh.NewNote().
 				Title("Review the generated scope").
-				Description(renderScopePreview(slug, lists)),
+				Description(renderScopePreview(slug, lists, opts)),
 			huh.NewConfirm().
-				Title("Create this engagement?").
-				Affirmative("Create").
+				Title(title).
+				Affirmative(verb).
 				Negative("Cancel").
 				Value(&confirmed),
 		),
 	).WithTheme(huh.ThemeFunc(ui.DecepticonTheme))
 	if err := preview.Run(); err != nil {
-		return "", scopeLists{}, fmt.Errorf("engagement setup cancelled: %w", err)
+		return scopeLists{}, scopeOptions{}, fmt.Errorf("scope review cancelled: %w", err)
 	}
 	if !confirmed {
-		return "", scopeLists{}, fmt.Errorf("engagement setup cancelled: scope review rejected")
+		return scopeLists{}, scopeOptions{}, fmt.Errorf("scope review rejected")
 	}
-	return slug, lists, nil
+	return lists, opts, nil
 }
 
-// renderScopePreview renders the normalized scope the engagement will enforce.
-func renderScopePreview(slug string, lists scopeLists) string {
+// promptScopeOptions collects the optional enforced RoE controls: the authorized
+// window length, extra forbidden destinations, and the cloud-metadata /
+// sensitive-TLD allow toggles. Seeded with the current values on edit. A
+// cancelled/EOF form keeps the seed (safe defaults on create).
+func promptScopeOptions(seed scopeOptions) (scopeOptions, error) {
+	windowStr := strconv.Itoa(seed.windowDays())
+	forbidden := strings.Join(seed.ForbiddenDestinations, ", ")
+	allowCloud := seed.AllowCloudMetadata
+	allowTLD := seed.AllowSensitiveTLDs
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().Title("Authorized window (days)").
+				Description("How long the engagement is authorized to run from now. Outside this window the agent pauses.").
+				Value(&windowStr).
+				Validate(func(s string) error {
+					n, err := strconv.Atoi(strings.TrimSpace(s))
+					if err != nil || n <= 0 {
+						return fmt.Errorf("enter a positive number of days")
+					}
+					return nil
+				}),
+			huh.NewInput().Title("Forbidden destinations (optional)").
+				Description("Always-denied hosts/IPs, in addition to the out-of-scope list and the built-in cloud-metadata guard.").
+				Value(&forbidden).
+				Validate(func(s string) error {
+					if strings.TrimSpace(s) == "" {
+						return nil
+					}
+					_, _, err := dedupeScopeTargets(splitScopeTargets([]string{s}))
+					return err
+				}),
+			huh.NewConfirm().Title("Allow cloud-metadata endpoints?").
+				Description("169.254.169.254 and friends. Default: blocked (recommended).").
+				Affirmative("Allow").Negative("Block").Value(&allowCloud),
+			huh.NewConfirm().Title("Allow sensitive TLDs (.gov/.mil/.edu/.int)?").
+				Description("Default: blocked (recommended).").
+				Affirmative("Allow").Negative("Block").Value(&allowTLD),
+		).Title("Scope options (optional)"),
+	).WithTheme(huh.ThemeFunc(ui.DecepticonTheme))
+	if err := form.Run(); err != nil {
+		// EOF/cancel → keep the seed (defaults on create).
+		return seed, nil
+	}
+	days, err := strconv.Atoi(strings.TrimSpace(windowStr))
+	if err != nil || days <= 0 {
+		days = seed.windowDays()
+	}
+	forb, _, _ := dedupeScopeTargets(splitScopeTargets([]string{forbidden}))
+	return scopeOptions{
+		WindowDays:            days,
+		ForbiddenDestinations: forb,
+		AllowCloudMetadata:    allowCloud,
+		AllowSensitiveTLDs:    allowTLD,
+	}, nil
+}
+
+// promptEditDraftScope re-collects the scope for a draft engagement, seeding the
+// form with its current in/out targets. Only valid while the engagement is a
+// draft (the caller gates on !IsStarted); the writer refuses once started.
+func promptEditDraftScope(home, slug string, inv *inventory.Store) (scopeLists, scopeOptions, error) {
+	root := filepath.Join(home, "workspace", slug)
+	curIn, curOut := readScopeTargets(root)
+	seed := readScopeOptions(root)
+	targets := strings.Join(curIn, " ")
+	outOfScope := strings.Join(curOut, " ")
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().Title("Target scope").
+				Description("In-scope targets — URLs, hostnames, CIDRs, or *.domain globs; commas or spaces separate entries.").
+				Value(&targets).
+				Validate(func(s string) error {
+					in, _, err := dedupeScopeTargets(splitScopeTargets([]string{s}))
+					if err != nil {
+						return err
+					}
+					if len(in) == 0 {
+						return fmt.Errorf("enter at least one in-scope target")
+					}
+					return nil
+				}),
+			huh.NewInput().Title("Out of scope (optional)").
+				Description("Entries the engagement must never touch; they override any in-scope match.").
+				Value(&outOfScope).
+				Validate(func(s string) error {
+					if strings.TrimSpace(s) == "" {
+						return nil
+					}
+					_, _, err := dedupeScopeTargets(splitScopeTargets([]string{s}))
+					return err
+				}),
+		).Title("Edit draft scope — "+slug),
+	).WithTheme(huh.ThemeFunc(ui.DecepticonTheme))
+	if err := form.Run(); err != nil {
+		return scopeLists{}, scopeOptions{}, fmt.Errorf("scope edit cancelled: %w", err)
+	}
+	return collectScope(slug, targets, outOfScope, "Save", seed, inv)
+}
+
+// mergeRecommendations unions remembered (inventory) and live-discovered scope
+// suggestions, preserving order (remembered first) and dropping duplicates.
+func mergeRecommendations(remembered, live []string) []string {
+	seen := make(map[string]bool, len(remembered)+len(live))
+	out := make([]string, 0, len(remembered)+len(live))
+	for _, group := range [][]string{remembered, live} {
+		for _, h := range group {
+			h = strings.TrimSpace(h)
+			if h == "" || seen[h] {
+				continue
+			}
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// renderScopePreview renders the normalized scope + options the engagement will
+// enforce.
+func renderScopePreview(slug string, lists scopeLists, opts scopeOptions) string {
 	// Huh notes interpret *, _ and backticks as formatting. Escape scope
 	// patterns so the operator reviews the exact authorized targets.
 	escape := strings.NewReplacer("\\", "\\\\", "*", "\\*", "_", "\\_", "`", "\\`")
 	join := func(targets []string) string { return escape.Replace(strings.Join(targets, ", ")) }
 	var b strings.Builder
-	fmt.Fprintf(&b, "Creating engagement %q — this scope is the authorization.\n\n", slug)
+	fmt.Fprintf(&b, "Engagement %q scope — this scope is the authorization.\n\n", slug)
 	fmt.Fprintf(&b, "In scope (%d): %s\n", len(lists.InScope), join(lists.InScope))
 	if len(lists.OutOfScope) > 0 {
 		fmt.Fprintf(&b, "Out of scope: %s\n", join(lists.OutOfScope))
@@ -745,6 +974,57 @@ func renderScopePreview(slug string, lists scopeLists) string {
 		fmt.Fprintf(&b, "Dropped (%d): %s\n", len(lists.Dropped), join(lists.Dropped))
 		fmt.Fprintf(&b, "  (no DNS/IP target can match a dropped entry)\n")
 	}
+	fmt.Fprintf(&b, "Authorized window: %d day(s) from now\n", opts.windowDays())
+	if len(opts.ForbiddenDestinations) > 0 {
+		fmt.Fprintf(&b, "Forbidden destinations: %s\n", join(opts.ForbiddenDestinations))
+	}
+	fmt.Fprintf(&b, "Cloud metadata: %s · Sensitive TLDs: %s\n", allowLabel(opts.AllowCloudMetadata), allowLabel(opts.AllowSensitiveTLDs))
 	b.WriteString("\nRed enforces this scope on every tool call.")
 	return b.String()
+}
+
+func allowLabel(allow bool) string {
+	if allow {
+		return "allowed"
+	}
+	return "blocked"
+}
+
+// readScopeOptions reads the optional enforced controls from an engagement's
+// roe.json to seed the draft-edit form. Missing fields fall back to defaults.
+func readScopeOptions(root string) scopeOptions {
+	data, err := os.ReadFile(filepath.Join(root, "plan", "roe.json"))
+	if err != nil {
+		return scopeOptions{}
+	}
+	var doc struct {
+		MachineEnforcement *struct {
+			AuthorizedWindows []struct {
+				Start string `json:"start"`
+				End   string `json:"end"`
+			} `json:"authorized_windows"`
+			ForbiddenDestinations []string `json:"forbidden_destinations"`
+			AllowCloudMetadata    bool     `json:"allow_cloud_metadata"`
+			AllowSensitiveTLDs    bool     `json:"allow_sensitive_tlds"`
+		} `json:"machine_enforcement"`
+	}
+	if json.Unmarshal(data, &doc) != nil || doc.MachineEnforcement == nil {
+		return scopeOptions{}
+	}
+	m := doc.MachineEnforcement
+	opts := scopeOptions{
+		ForbiddenDestinations: m.ForbiddenDestinations,
+		AllowCloudMetadata:    m.AllowCloudMetadata,
+		AllowSensitiveTLDs:    m.AllowSensitiveTLDs,
+	}
+	if len(m.AuthorizedWindows) > 0 {
+		if start, err1 := time.Parse(time.RFC3339, m.AuthorizedWindows[0].Start); err1 == nil {
+			if end, err2 := time.Parse(time.RFC3339, m.AuthorizedWindows[0].End); err2 == nil {
+				if days := int(end.Sub(start).Hours() / 24); days > 0 {
+					opts.WindowDays = days
+				}
+			}
+		}
+	}
+	return opts
 }

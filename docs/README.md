@@ -13,7 +13,6 @@ in the root [CHAGELOG.md](../CHAGELOG.md).
 | Use the terminal | [CLI reference](cli-reference.md), [runtime controls](runtime-controls.md) |
 | Operate an engagement | [Engagement workflow](engagement-workflow.md), [RoE provisioning](roe-provisioning.md) |
 | Observe Blue Cell | [Blue Cell](features/blue-cell.md) |
-| Open the optional dashboard | [Web dashboard](web-dashboard.md) |
 | Use a coding agent | [External agents and CLI wrapper skill](integrations/external-agents.md) |
 | Integrate Python packages | [Library usage](library-usage.md), [consumer guide](library-consumer-guide.md) |
 | Configure models | [Models](models.md) |
@@ -29,6 +28,7 @@ in the root [CHAGELOG.md](../CHAGELOG.md).
 | Author business workflows | [Workflow authoring](design/workflow-authoring.md) |
 | Build plugins | [Plugin author guide](plugin-author-guide.md) |
 | Understand runtime design | [Architecture](architecture.md), [architecture decisions](adr/README.md) |
+| Evaluate a local-first Rust port | [Proposed architecture](design/2026-11-16-local-first-rust.md), [storage/framework research](research/2026-11-16-agent-storage-frameworks.md) |
 | Qualify a release | [Release policy](../RELEASE.md), [release evidence](releases/) |
 
 Runtime knowledge lives under
@@ -47,7 +47,6 @@ Business processes use `WORKFLOW.md` under the framework workflow catalog.
 | `clients/launcher/` | Installed Go launcher |
 | `clients/cli/` | Interactive Ink terminal UI |
 | `clients/shared/` | Shared client libraries |
-| `clients/web/` | Optional web dashboard |
 | `skills/` | External coding-agent wrapper skills; separate from runtime Skillogy knowledge |
 | `benchmark/` | Benchmarks, including the canonical `benchmark.terminal_bench` adapter |
 | `containers/`, `config/` | Container builds and runtime configuration |
@@ -55,7 +54,7 @@ Business processes use `WORKFLOW.md` under the framework workflow catalog.
 | `docs/` | Guides, decisions, research, and verification records |
 
 The deprecated Electron shell has been retired. Start the terminal with
-`decepticon start`; open the optional dashboard with `/web` inside the terminal.
+`decepticon start`.
 Host Desktop integration contracts in the launcher are separate from that
 retired Electron package and remain supported.
 

@@ -1,7 +1,7 @@
 """Bash tool for the Decepticon agent.
 
 Thin wrapper around HTTPTransportSandbox.execute_tmux(). All tmux session
-management and PS1 polling logic lives in decepticon/sandbox_kernel/
+management and PS1 polling logic lives in decepticon_sandbox/kernel/
 (tmux.py + base.py), shared with the in-container daemon.
 
 The sandbox instance is injected at agent startup via set_sandbox().
@@ -33,11 +33,11 @@ from collections import OrderedDict
 from functools import partial
 
 from anyio import to_thread
+from decepticon_sandbox.kernel.base import SandboxBase
+from decepticon_sandbox.kernel.tmux import _interpret_exit_code
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-from decepticon.sandbox_kernel.base import SandboxBase
-from decepticon.sandbox_kernel.tmux import _interpret_exit_code
 from decepticon.tools.bash.protocol import BashSandboxProtocol
 
 log = logging.getLogger("decepticon.tools.bash.bash")
@@ -272,17 +272,21 @@ def _sandbox_from_config(config: RunnableConfig | None) -> BashSandboxProtocol |
     Returns ``None`` when the config carries no sandbox endpoint (single-tenant
     / dev / OSS self-host), so the caller falls back to the process default.
     """
-    if os.environ.get("DECEPTICON_SANDBOX_PROVIDER", "").strip() == "openshell":
-        from decepticon.backends.factory import build_sandbox_backend
+    from decepticon.backends.providers import uses_openshell
 
-        return build_sandbox_backend(config)
     configurable = (config or {}).get("configurable", {})
+    if uses_openshell(configurable):
+        from decepticon.backends.factory import _run_config, build_sandbox_backend
+
+        run_config = _run_config(config)
+        if not run_config:
+            # Outside a run (library calls, CLI one-shots, tests) the
+            # explicitly installed sandbox (set_sandbox) wins; inside a run
+            # the run's admitted OpenShell binding does.
+            return None
+        return build_sandbox_backend(run_config)
     if not isinstance(configurable, dict):
         return None
-    if configurable.get("sandbox_provider") == "openshell":
-        from decepticon.backends.factory import build_sandbox_backend
-
-        return build_sandbox_backend(config)
     url = configurable.get("sandbox_url")
     if not isinstance(url, str) or not url:
         return None

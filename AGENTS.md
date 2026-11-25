@@ -36,3 +36,34 @@ follow [RELEASE.md](RELEASE.md): classify by compatibility/user impact, verify
 actual WSL product and candidate artifacts, preserve immutable versions and user
 data, and record the actual publication date. A merged PR does not authorize a
 release or require a version bump. SaaS identifiers remain independent.
+
+# Rust HTTP servers
+
+Use Axum when adding or porting Rust HTTP server code.
+
+# Required CI results
+
+| Rule | Enforcement |
+|---|---|
+| CI aggregation accepts only success or intentional skipped results; incomplete, unknown and missing results fail. | Actual workflow Bash exercised by tests/ci/test_ci_aggregate.py, including the historical abandoned-run reproduction. |
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->
+
+# Entire development and privacy
+
+Use the official Entire skills and generated agent guide. See
+[setup and qualification](docs/operations/entire-native-development-20261115.md).
+Keep GitHub-backed mirrors and both review gates; do not detach or bypass gates.
+Keep Brain local-only with ENTIRE_BRAIN_NO_EGRESS=1. Before opening or updating
+a PR, update the single root CHAGELOG.md and link it from the PR description.
+Keep checkpoint uploads disabled for public source; do not attach sessions
+containing private work.
+
+# Model credential binding
+
+| Invariant | Enforcement |
+| --- | --- |
+| Binding a per-run proxy key retains the selected model's transport/protocol configuration and never silently dispatches with an environment key on binding failure. | `tests/ci/verify_proxy_key_transport.py`, real loopback HTTP/SSE and sync/async rejection cases; immutable historical middleware must fail all six regression assertions. |

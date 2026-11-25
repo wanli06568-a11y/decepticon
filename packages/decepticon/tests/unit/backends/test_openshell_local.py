@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from decepticon_sandbox.server.session_client import MANAGED_START
 
 from decepticon.backends import factory, openshell_local
 from decepticon.backends.openshell_local import (
@@ -21,7 +22,6 @@ from decepticon.backends.openshell_local import (
     resolve_local_binding,
 )
 from decepticon.middleware.policy_compiler import compile_openshell_policy
-from decepticon.sandbox_server.session_client import MANAGED_START
 from decepticon_core.types.roe import MachineEnforcement
 
 pytest.importorskip("openshell")
@@ -339,8 +339,10 @@ class TestResolverInstallGating:
 def test_existing_policy_must_be_observed_loaded_before_daemon_exec(tmp_path, monkeypatch, failure):
     from openshell._proto import openshell_pb2
 
+    from decepticon.middleware._roe_rules import (
+        load_machine_enforcement as _load_rules_for_workspace,
+    )
     from decepticon.middleware.policy_compiler import sandbox_binding_digest, sandbox_name
-    from decepticon.middleware.roe import _load_rules_for_workspace
 
     workspace = _workspace(tmp_path)
     compiled = compile_openshell_policy(_load_rules_for_workspace(str(workspace)))
@@ -412,7 +414,9 @@ def test_actual_sdk_authenticated_loopback_policy_rpc(tmp_path, corrupt):
     from openshell._proto import openshell_pb2_grpc, sandbox_pb2
 
     from decepticon.backends.http_transport import SandboxError
-    from decepticon.middleware.roe import _load_rules_for_workspace
+    from decepticon.middleware._roe_rules import (
+        load_machine_enforcement as _load_rules_for_workspace,
+    )
 
     workspace = _workspace(tmp_path)
     compiled = compile_openshell_policy(_load_rules_for_workspace(str(workspace)))

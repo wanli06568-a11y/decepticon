@@ -54,8 +54,8 @@ Inside the sandbox container, the daemon (`sandbox_server/app.py` wrapping
 ```
 
 So a write to `/workspace/findings/FIND-001.md` lands at
-`~/.decepticon/workspace/<slug>/findings/FIND-001.md` on the host and is
-visible to the web dashboard (which mounts the same tree read-only).
+`~/.decepticon/workspace/<slug>/findings/FIND-001.md` on the host, where
+operators and host tools can read it directly.
 
 **Engagement isolation is physical, not state-level.** Each engagement is
 its own subdirectory; the scoping backend prevents any agent from reaching
@@ -69,7 +69,6 @@ middleware, not agents:
 - `events.jsonl` — append-only structured event log (`EventLogMiddleware`,
   `runtime/event_log.py`): engagement start, agent turns, LLM/tool calls,
   findings, OPPLAN updates. Failures here never break the agent.
-- `audit/roe-decisions.jsonl` — HMAC-chained RoE decision ledger (`_audit_sink.py`).
   Every RoE pass/refuse is stamped with `seq`, `hash`, `prev_hash`, `hmac`;
   tampering with record N invalidates all later records.
 
@@ -336,12 +335,6 @@ core capability stays benchmark-agnostic.
 
 The host-mounted workspace tree is what the clients render.
 
-- **Web dashboard** (`clients/web`): the Documents page scans the folders
-  `recon`, `exploit`, `post-exploit`, `findings`, `report` via
-  `/api/workspace/<name>/files` and renders a folder tree + file viewer
-  (`.md` / `.json` / plaintext), with per-domain icons. `plan/` is excluded
-  from Documents — it has its own Plan page. The Findings viewer parses
-  `findings/FIND-NNN.md` directly.
 - **CLI** (`clients/cli`): no dedicated file browser; sub-agent tool calls
   and results stream through `StreamingRunnable` (LangGraph SDK), so findings
   appear inline in the event flow as they are written.

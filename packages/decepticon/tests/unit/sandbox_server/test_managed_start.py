@@ -15,7 +15,7 @@ pytest.importorskip("fcntl")
 
 @pytest.fixture
 def managed():
-    return importlib.import_module("decepticon.sandbox_server.managed_start")
+    return importlib.import_module("decepticon_sandbox.server.managed_start")
 
 
 @pytest.fixture
@@ -66,6 +66,44 @@ def test_reconnect_reuses_same_process_and_does_not_truncate_log(managed, prepar
     }
     assert spawn.call_count == 1
     assert (state / "daemon.log").read_bytes() == b"retained log\n"
+
+
+def test_changed_context_still_restores_the_supplied_approved_bytes(managed, prepared):
+    root, state, content, message, child, spawn = prepared
+    plan = root / "plan"
+    plan.mkdir()
+    path = plan / "roe.json"
+    path.write_bytes(b'{"old":"context"}')
+    path.chmod(0o444)
+    managed.restore_scope(root, content)
+    assert path.read_bytes() == content
+    assert path.stat().st_mode & 0o777 == 0o400
+
+
+def test_matching_writable_context_is_still_resealed_private(managed, prepared):
+    root, state, content, message, child, spawn = prepared
+    plan = root / "plan"
+    plan.mkdir()
+    path = plan / "roe.json"
+    path.write_bytes(content)
+    path.chmod(0o644)
+    before = path.stat().st_ino
+    managed.restore_scope(root, content)
+    assert path.read_bytes() == content
+    assert path.stat().st_mode & 0o777 == 0o400
+    assert path.stat().st_ino != before
+
+
+def test_unreadable_ordinary_context_can_still_be_atomically_restored(managed, prepared):
+    root, state, content, message, child, spawn = prepared
+    plan = root / "plan"
+    plan.mkdir()
+    path = plan / "roe.json"
+    path.write_bytes(content)
+    path.chmod(0o200)
+    managed.restore_scope(root, content)
+    assert path.read_bytes() == content
+    assert path.stat().st_mode & 0o777 == 0o400
 
 
 def test_concurrent_reconnects_start_one_process(managed, prepared):
@@ -163,7 +201,7 @@ def test_managed_serve_pins_shell_home_and_immutable_package_root(managed, monke
     monkeypatch.setattr(managed.sys, "path", list(managed.sys.path))
 
     def start(module, run_name):
-        assert module == "decepticon.sandbox_server" and run_name == "__main__"
+        assert module == "decepticon_sandbox.server" and run_name == "__main__"
         assert os.environ["HOME"] == "/workspace"
         assert os.environ["SHELL"] == "/bin/bash"
         assert os.environ["SANDBOX_DAEMON_HOST"] == "127.0.0.1"
@@ -177,7 +215,7 @@ def test_managed_serve_pins_shell_home_and_immutable_package_root(managed, monke
 
 
 def test_managed_health_reports_real_process_identity(managed):
-    from decepticon.sandbox_server.app import healthz
+    from decepticon_sandbox.server.app import healthz
 
     with patch.dict(os.environ, {"DECEPTICON_MANAGED_SESSION": "1"}):
         assert healthz() == {

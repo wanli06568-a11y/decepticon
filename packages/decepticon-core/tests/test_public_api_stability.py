@@ -39,6 +39,15 @@ CORE_PUBLIC_API: tuple[tuple[str, str], ...] = (
     ("decepticon_core.types.engagement", "EngagementType"),
     ("decepticon_core.types.engagement", "ScopeEntry"),
     ("decepticon_core.types.engagement", "EscalationContact"),
+    # decepticon_core.types.engagement — OPPLAN objective lifecycle model
+    ("decepticon_core.types.engagement", "OBJECTIVE_STATUS_TRANSITIONS"),
+    ("decepticon_core.types.engagement", "OBJECTIVE_INVALIDATION_TRANSITIONS"),
+    ("decepticon_core.types.engagement", "RESOLVED_OBJECTIVE_STATUSES"),
+    ("decepticon_core.types.engagement", "ACTIONABLE_OBJECTIVE_STATUSES"),
+    ("decepticon_core.types.engagement", "PREREQUISITE_BOUND_OBJECTIVE_STATUSES"),
+    ("decepticon_core.types.engagement", "can_transition_objective"),
+    ("decepticon_core.types.engagement", "next_objective_statuses"),
+    ("decepticon_core.types.engagement", "ObjectiveOutcome"),
     # decepticon_core.types.llm
     ("decepticon_core.types.llm", "Tier"),
     ("decepticon_core.types.llm", "AuthMethod"),
@@ -73,6 +82,9 @@ CORE_PUBLIC_API: tuple[tuple[str, str], ...] = (
     ("decepticon_core.types.event_store", "StoreMetrics"),
     ("decepticon_core.types.event_store", "IngestResult"),
     ("decepticon_core.types.event_store", "SEARCHABLE_FIELDS"),
+    # decepticon_core.types.host — per-run configuration a trusted host passes
+    ("decepticon_core.types.host", "HostRunConfigurable"),
+    ("decepticon_core.types.host", "HOST_RUN_CONFIGURABLE_KEYS"),
     # decepticon_core.protocols
     ("decepticon_core.protocols", "BackendProtocol"),
     ("decepticon_core.protocols", "MiddlewareProtocol"),
@@ -158,7 +170,7 @@ def test_manifest_count_unchanged() -> None:
     # (EventStoreProtocol + EventPage, SourceInfo, StoreMetrics, IngestResult,
     # SEARCHABLE_FIELDS). See CHANGELOG.
     # 2026-10-23: 86 -> 87, AutoBot CoverageAdapterProtocol added. See CHANGELOG.
-    expected = 87
+    expected = 97
     actual = len(CORE_PUBLIC_API)
     assert actual == expected, (
         f"CORE_PUBLIC_API has {actual} entries, expected {expected}. "

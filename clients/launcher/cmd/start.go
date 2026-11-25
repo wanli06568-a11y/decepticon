@@ -13,16 +13,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BitterSecurity/Decepticon/clients/launcher/cmd/infracontrol"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/compose"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/config"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/inventory"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/engagement"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/health"
 	opsinternal "github.com/BitterSecurity/Decepticon/clients/launcher/internal/infracontrol"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/migrate"
+	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/openshell"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/platform"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/starprompt"
 	"github.com/BitterSecurity/Decepticon/clients/launcher/internal/ui"
@@ -329,7 +332,10 @@ func runStartMode(cmd *cobra.Command, args []string, existingEngagement string, 
 	ui.Info("[3/5] Engagement · select a workspace")
 	var choice engagement.Choice
 	if existingEngagement == "" {
-		choice, err = engagement.Select(home)
+		// Pass the stack-postgres DSN so the picker can reuse the asset
+		// inventory (best-effort — unavailable on a first run before the
+		// stack is up; the picker opens it and falls back to live discovery).
+		choice, err = engagement.Select(home, inventoryDSN(env))
 	} else {
 		choice, err = engagement.ResolveExistingAt(home, existingEngagement, os.Getenv("DECEPTICON_DESKTOP_WORKSPACE"))
 	}
@@ -347,7 +353,7 @@ func runStartMode(cmd *cobra.Command, args []string, existingEngagement string, 
 	if err := os.Setenv("DECEPTICON_ENGAGEMENT_WORKSPACE", choice.WorkspacePath); err != nil {
 		return fmt.Errorf("set engagement workspace env: %w", err)
 	}
-	// Bind the service namespace independently of the web container host view.
+	// Bind the service namespace independently of the host workspace view.
 	runtimeEngagement := ""
 	if desktopRuntime == nil {
 		runtimeEngagement = choice.Engagement
@@ -431,10 +437,26 @@ func runStartMode(cmd *cobra.Command, args []string, existingEngagement string, 
 		defer os.Remove(overlay)
 		c.OverlayFile = overlay
 	}
+	// Stand up the OpenShell admission gateway alongside the stack so the
+	// default `openshell` sandbox provider can admit this engagement out of
+	// the box. The compute engine is chosen from the detected container
+	// runtime (podman → rootless, else docker); the exported OPENSHELL_* env
+	// reaches compose via ComposeCommandEnv()'s os.Environ() forwarding.
+	gwProfile, gwLabel, gwErr := openshell.PrepareGateway(home, c.Runtime)
+	if gwErr != nil {
+		return fmt.Errorf("prepare OpenShell gateway: %w; inspect with `decepticon doctor`", gwErr)
+	}
+	ui.Info("Sandbox boundary · OpenShell gateway: " + gwLabel)
+
 	ui.Info("[4/5] Services · starting and waiting for readiness")
-	startServices := func() error { return c.Up(compose.Profiles.CLI) }
+	startServices := func() error { return c.Up(compose.Profiles.CLI, gwProfile) }
 	if existingEngagement != "" && !attachInteractive {
-		startServices = c.UpDesktop
+		startServices = func() error {
+			if err := c.Up(gwProfile); err != nil {
+				return err
+			}
+			return c.UpDesktop()
+		}
 	}
 	if err := startServices(); err != nil {
 		return fmt.Errorf("start services: %w; inspect with `decepticon doctor` and `decepticon logs` (services kept)", err)
@@ -445,6 +467,13 @@ func runStartMode(cmd *cobra.Command, args []string, existingEngagement string, 
 	// 5. Health checks
 	if err := waitForStartupServices(cmd.Context(), c, env, existingEngagement); err != nil {
 		return fmt.Errorf("service readiness: %w; inspect `decepticon doctor` and `decepticon logs` (services kept)", err)
+	}
+
+	// Entering the live engagement (TUI, desktop, or background) LOCKS the
+	// scope: the RoE is immutable from here on, and a different scope requires
+	// a new engagement. Draft engagements stay editable until this point.
+	if err := engagement.MarkStarted(choice.WorkspacePath); err != nil {
+		ui.Warning("could not write engagement start marker (scope lock): " + err.Error())
 	}
 
 	// The desktop agent service ends here — it serves host clients and has
@@ -506,9 +535,6 @@ func runStartMode(cmd *cobra.Command, args []string, existingEngagement string, 
 	if choice.AuthorizationConfirmed {
 		cliEnv["DECEPTICON_AUTHORIZATION_CONFIRMED"] = "true"
 	}
-	if port := config.Get(env, "WEB_PORT", "3000"); port != "" {
-		cliEnv["WEB_PORT"] = port
-	}
 
 	// Background mode: services are up and the engagement workspace is bound;
 	// skip the interactive CLI and let the operator attach later.
@@ -536,6 +562,20 @@ func runStartMode(cmd *cobra.Command, args []string, existingEngagement string, 
 
 // Interactive sessions consume the API from the CLI container. Service-only
 // launches serve host clients and must continue to verify the published route.
+// inventoryDSN builds the stack-postgres connection string for the asset
+// inventory from the engagement env. Postgres is published on 127.0.0.1 by the
+// compose `postgres` service (user decepticon, db litellm).
+func inventoryDSN(env map[string]string) string {
+	port := 5432
+	if p := strings.TrimSpace(config.Get(env, "POSTGRES_PORT", "")); p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			port = n
+		}
+	}
+	pass := config.Get(env, "POSTGRES_PASSWORD", "decepticon")
+	return inventory.DSN("127.0.0.1", port, "decepticon", pass, "litellm")
+}
+
 func waitForStartupServices(ctx context.Context, c *compose.Compose, env map[string]string, existingEngagement string) error {
 	probe := c.ProbeCLI
 	if existingEngagement != "" {

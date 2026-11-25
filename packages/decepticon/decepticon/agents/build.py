@@ -93,7 +93,7 @@ class SafetyOverrideViolation(RuntimeError):
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _iter_override_bundles(role: str) -> Iterator[PluginBundle]:
+def iter_override_bundles(role: str) -> Iterator[PluginBundle]:
     """Yield every ``PluginBundle`` registered under
     ``decepticon.bundles`` that is enabled AND scoped to ``role``."""
     try:
@@ -137,11 +137,17 @@ def _iter_override_bundles(role: str) -> Iterator[PluginBundle]:
         yield bundle
 
 
+# Former private name. Internal callers keep using it so tests that patch
+# ``decepticon.agents.build._iter_override_bundles`` still take effect.
+_iter_override_bundles = iter_override_bundles
+
+
 def resolve_role_model(role: str) -> str | None:
     """Composed override for a role's PRIMARY model.
 
-    Precedence: ``DECEPTICON_DESKTOP_MODEL`` for Desktop Local, then
-    ``DECEPTICON_MODEL_<ROLE>`` (operator env), then a
+    Precedence: a host-provisioned policy, then ``DECEPTICON_FORCED_MODEL``
+    (legacy alias ``DECEPTICON_DESKTOP_MODEL``) for a single host-selected
+    model, then ``DECEPTICON_MODEL_<ROLE>`` (operator env), then a
     ``PluginBundle.models`` entry (plugin), then the tier default
     (returned as ``None`` here — the factory keeps the default when this
     yields nothing). This is the model analogue of ``build_middleware`` /
@@ -149,17 +155,23 @@ def resolve_role_model(role: str) -> str | None:
     rather than editing the OSS tier map. Returns the winning model id
     or ``None`` when neither an env nor a bundle override is set.
     """
-    from decepticon.desktop_policy import read_desktop_policy
+    from decepticon_core.contracts.host_integration import get_host_integration
 
-    policy = read_desktop_policy()
+    host = get_host_integration()
+    policy = host.read_policy()
     if policy is not None:
-        return policy.selection(role).model
-    # Desktop Local selects one model for this invocation.  The proxy's
+        return host.model_selection(policy, role).model
+    # A host may select one model for this invocation.  The proxy's
     # DECEPTICON_MODEL route alone does not change the framework's per-role
     # assignments, so apply the selection at the factory boundary too.
-    desktop_model = os.environ.get("DECEPTICON_DESKTOP_MODEL", "").strip()
-    if desktop_model:
-        return desktop_model
+    # ``DECEPTICON_DESKTOP_MODEL`` is the deprecated alias of the host-neutral
+    # ``DECEPTICON_FORCED_MODEL``; the new name wins when both are set.
+    forced_model = (
+        os.environ.get("DECEPTICON_FORCED_MODEL", "").strip()
+        or os.environ.get("DECEPTICON_DESKTOP_MODEL", "").strip()
+    )
+    if forced_model:
+        return forced_model
     env = os.environ.get(f"DECEPTICON_MODEL_{role.upper()}", "").strip()
     if env:
         return env
@@ -506,8 +518,10 @@ def build_tools(
             ``dict[name, tool]`` (preferred — direct override by name)
             or a plain ``list[tool]`` (we infer names via ``.name``
             attribute).
-        overrides: name → replacement tool. Wins over plugin overrides.
-        disabled_tools: tool names to drop from the baseline.
+        overrides: name → replacement tool. Wins over plugin overrides and
+            additive tool contributions with the same name.
+        disabled_tools: tool names to drop from the baseline and additive
+            plugin contributions. Host-policy tool selection stays host-owned.
 
     Returns:
         list of tools ready for ``create_agent(..., tools=...)``.
@@ -520,10 +534,10 @@ def build_tools(
     else:
         base = {_tool_name(t): t for t in standard_tools}
 
-    from decepticon.desktop_policy import read_desktop_policy
-    from decepticon.desktop_tools import policy_tools
+    from decepticon_core.contracts.host_integration import get_host_integration
 
-    if read_desktop_policy() is not None:
+    host = get_host_integration()
+    if host.read_policy() is not None:
         _check_safety_gate(
             role=role,
             mw_replace={},
@@ -534,7 +548,8 @@ def build_tools(
         for name in disabled_tools or ():
             base.pop(name, None)
         base.update(overrides or {})
-        return [*base.values(), *policy_tools(role)]
+        extra = list(host.policy_tools(role))
+        return [*_yield_browser_surface(base, extra).values(), *extra]
 
     resolved = _resolve_overrides(
         role=role,
@@ -556,9 +571,35 @@ def build_tools(
         base.pop(name, None)
     base.update(resolved.tool_replace)
 
-    result = list(base.values())
-    result.extend(load_plugin_tools(role=role))
+    # A later additive contribution must not resurrect a disabled tool or
+    # duplicate an explicitly selected replacement with an older schema.
+    suppressed = set(resolved.tool_replace) | resolved.tool_disable
+    plugin_tools = [
+        item for item in load_plugin_tools(role=role) if _tool_name(item) not in suppressed
+    ]
+    result = list(_yield_browser_surface(base, plugin_tools).values())
+    result.extend(plugin_tools)
     return result
+
+
+def _yield_browser_surface(base: dict[str, Any], extra_tools: list[Any]) -> dict[str, Any]:
+    """Drop the OSS agent browser tools when a host/plugin ships its own.
+
+    A plugin or host that provides any tool named like an OSS browser tool
+    owns the browser surface for the role: keeping both would duplicate
+    tool names or mix two browser backends. The OSS group is removed as a
+    whole (docs/design/browser-providers.md).
+    """
+    from decepticon.tools.browser.names import AGENT_BROWSER_TOOL_NAMES
+
+    extra_names = {_tool_name(t) for t in extra_tools}
+    if not extra_names & AGENT_BROWSER_TOOL_NAMES:
+        return base
+    logger.info(
+        "browser tools supplied by host/plugin (%s); removing OSS browser provider tools",
+        ", ".join(sorted(extra_names & AGENT_BROWSER_TOOL_NAMES)),
+    )
+    return {name: tool for name, tool in base.items() if name not in AGENT_BROWSER_TOOL_NAMES}
 
 
 def _tool_name(tool: Any) -> str:

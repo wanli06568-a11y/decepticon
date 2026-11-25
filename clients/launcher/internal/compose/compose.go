@@ -63,11 +63,17 @@ var Profiles = struct {
 	C2        string
 	AD        string
 	Reversing string
+	OpenShell string
 }{
 	CLI:       "cli",
 	C2:        "c2-sliver",
 	AD:        "ad",
 	Reversing: "reversing",
+	// OpenShell is the standing sandbox-admission gateway. Unlike the
+	// specialist workloads, `decepticon start` activates it alongside
+	// `cli` so the default `openshell` sandbox provider can admit
+	// engagements out of the box (see internal/openshell).
+	OpenShell: "openshell",
 }
 
 // AllProfiles returns every profile flag the launcher should pass
@@ -81,6 +87,7 @@ func AllProfiles() []string {
 		"--profile", Profiles.C2,
 		"--profile", Profiles.AD,
 		"--profile", Profiles.Reversing,
+		"--profile", Profiles.OpenShell,
 	}
 }
 
@@ -232,7 +239,7 @@ func (c *Compose) UpDatabases() error {
 }
 
 // Desktop owns its UI and terminal. Start only the agent services and their
-// Compose dependencies; the web dashboard and interactive CLI are unnecessary.
+// Compose dependencies; the interactive CLI is unnecessary.
 func (c *Compose) UpDesktop() error {
 	return c.upWithNetworkRecovery([]string{"up", "-d", "--no-build", "--wait", "--wait-timeout", startupTimeoutSeconds(), "langgraph", "skillogy"})
 }
